@@ -21,9 +21,11 @@ X（Twitter）：https://x.com/0x515151
 
 ## 📦 安裝方式（一鍵安裝）
 1. 安裝瀏覽器外掛 **Tampermonkey**  
-   （支援 Chrome / Edge / Brave）
+https://chromewebstore.google.com/detail/dhdgffkkebhmkfjojejmpbldmpobfkfo?utm_source=item-share-cb
+       （支援 Chrome / Edge / Brave）
 
-2. 點擊以下連結即可安裝腳本：
+
+3. 點擊以下連結即可安裝腳本：
 
 👉 **安裝連結：**  
 https://raw.githubusercontent.com/happycooper406-collab51/TradeGenius-AutoPilot/main/tradegenius-autopilot.user.js
