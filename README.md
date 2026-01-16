@@ -5,7 +5,7 @@
 
 作者：**51 | Hunter Association**  
 X（Twitter）：https://x.com/0x515151
-TradeGenius Link: www.tradegenius.com/ref/8C2TSF
+Use Link to GET 500GP：www.tradegenius.com/ref/8C2TSF
 ---
 
 ## 🔧 功能特色
