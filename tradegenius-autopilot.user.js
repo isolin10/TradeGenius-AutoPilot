@@ -98,7 +98,7 @@ titleWrap.appendChild(author);
 
     const tip = document.createElement('div');
     tip.style.cssText = `font-size:12px; opacity:.85; margin-bottom:8px;`;
-    tip.textContent = 'Tip: 先確保頁面手動可交易（MAX/Confirm 不灰）再開。';
+    tip.textContent = 'Tip: 先確保頁面手動可交易（MAX/Confirm 不灰）再開，全程使用EN介面。';
 
     const log = document.createElement('pre');
     log.style.cssText = `
