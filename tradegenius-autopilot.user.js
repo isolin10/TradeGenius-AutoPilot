@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Auto Swap Bot + Random Auto Refresh
 // @namespace    https://hunter-association.io
-// @version      2.0.0
-// @description  Automated swap execution with random auto-refresh (20-40min)
+// @version      2.1.0
+// @description  Automated swap execution with random auto-refresh (20-40min) - Fixed auto-resume after refresh
 // @author       伍壹51
 // @homepage     https://x.com/0x515151
 // @match        https://www.tradegenius.com/trade
@@ -41,6 +41,7 @@
     waitAfterTabClick: 800,
     waitForHover: 500,
     waitBeforeStart: 1200,
+    KEY_SWAP_ENABLED: 'tg_swap_enabled',
   };
 
   // ========= 共用工具函數 =========
@@ -53,10 +54,12 @@
     const s = Math.max(0, Math.floor(ms / 1000));
     const m = Math.floor(s / 60);
     const r = s % 60;
-    return `${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`;
+    return String(m).padStart(2, '0') + ':' + String(r).padStart(2, '0');
   };
 
   // ========= Swap Bot 變數 =========
+  let swapEnabled = localStorage.getItem(SWAP_CONFIG.KEY_SWAP_ENABLED);
+  swapEnabled = swapEnabled === '1';
   let isSwapRunning = false;
   let selectedFromToken = null;
   let loopPromise = null;
@@ -94,7 +97,7 @@
     logSwap(msg) {
       if (!this.swapLogEl) return;
       const t = new Date().toLocaleTimeString();
-      this.swapLogEl.textContent = `[${t}] ${msg}\n` + this.swapLogEl.textContent.slice(0, 1200);
+      this.swapLogEl.textContent = '[' + t + '] ' + msg + '\n' + this.swapLogEl.textContent.slice(0, 1200);
     },
 
     renderRefresh(nextAt) {
@@ -105,10 +108,10 @@
       this.refreshBtnToggle.style.background = isOn ? '#dc2626' : '#16a34a';
 
       const at = nextAt ?? Number(localStorage.getItem(REFRESH_CONFIG.KEY_NEXT_AT) || 0);
-      this.refreshNextEl.textContent = at ? `Next: ${fmtTime(at)}` : 'Next: -';
+      this.refreshNextEl.textContent = at ? 'Next: ' + fmtTime(at) : 'Next: -';
 
       const leftMs = at ? (at - Date.now()) : 0;
-      this.refreshLeftEl.textContent = at ? `Left: ${fmtLeft(leftMs)}` : 'Left: -';
+      this.refreshLeftEl.textContent = at ? 'Left: ' + fmtLeft(leftMs) : 'Left: -';
     }
   };
 
@@ -116,99 +119,74 @@
     if (UI.root) return;
 
     const root = document.createElement('div');
-    root.style.cssText = `
-      position: fixed; right: 16px; bottom: 16px; z-index: 999999;
-      width: 300px; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      border-radius: 12px; overflow: hidden;
-      background: rgba(17,24,39,.92); color: #e5e7eb; backdrop-filter: blur(8px);
-      box-shadow: 0 10px 30px rgba(0,0,0,.25);
-    `;
+    root.style.cssText = 'position: fixed; right: 16px; bottom: 16px; z-index: 999999; width: 300px; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; border-radius: 12px; overflow: hidden; background: rgba(17,24,39,.92); color: #e5e7eb; backdrop-filter: blur(8px); box-shadow: 0 10px 30px rgba(0,0,0,.25);';
 
     // ========= Swap Bot Section =========
     const swapHeader = document.createElement('div');
-    swapHeader.style.cssText = `padding: 10px 12px; display:flex; align-items:center; gap:10px; border-bottom: 1px solid rgba(255,255,255,.08);`;
+    swapHeader.style.cssText = 'padding: 10px 12px; display:flex; align-items:center; gap:10px; border-bottom: 1px solid rgba(255,255,255,.08);';
 
     const swapDot = document.createElement('span');
-    swapDot.style.cssText = `width:10px; height:10px; border-radius:999px; background:#dc2626; display:inline-block;`;
+    swapDot.style.cssText = 'width:10px; height:10px; border-radius:999px; background:#dc2626; display:inline-block;';
 
     const swapTitleWrap = document.createElement('div');
-    swapTitleWrap.style.cssText = `display:flex; flex-direction:column; line-height:1.15;`;
+    swapTitleWrap.style.cssText = 'display:flex; flex-direction:column; line-height:1.15;';
 
     const swapTitle = document.createElement('div');
     swapTitle.textContent = 'AutoSwap Bot';
-    swapTitle.style.cssText = `font-weight:700; font-size:13px;`;
+    swapTitle.style.cssText = 'font-weight:700; font-size:13px;';
 
     const swapStatus = document.createElement('div');
     swapStatus.textContent = 'STOPPED';
-    swapStatus.style.cssText = `font-size:12px; opacity:.9;`;
+    swapStatus.style.cssText = 'font-size:12px; opacity:.9;';
 
     swapTitleWrap.appendChild(swapTitle);
     swapTitleWrap.appendChild(swapStatus);
 
     const swapBtn = document.createElement('button');
     swapBtn.textContent = 'Start (Ctrl+Alt+S)';
-    swapBtn.style.cssText = `
-      margin-left:auto; border:0; cursor:pointer; color:white;
-      background:#16a34a; padding:8px 10px; border-radius:10px;
-      font-weight:700; font-size:12px;
-    `;
+    swapBtn.style.cssText = 'margin-left:auto; border:0; cursor:pointer; color:white; background:#16a34a; padding:8px 10px; border-radius:10px; font-weight:700; font-size:12px;';
 
     swapHeader.appendChild(swapDot);
     swapHeader.appendChild(swapTitleWrap);
     swapHeader.appendChild(swapBtn);
 
     const swapBody = document.createElement('div');
-    swapBody.style.cssText = `padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.08);`;
+    swapBody.style.cssText = 'padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.08);';
 
-    // ========= Author Info (移到這裡，在 Tip 上面) =========
+    // ========= Author Info =========
     const authorInfo = document.createElement('div');
-    authorInfo.style.cssText = `
-      font-size:11px; opacity:.75; margin-bottom:8px;
-      padding:6px 8px; border-radius:8px;
-      background: rgba(0,0,0,.15);
-      border: 1px solid rgba(255,255,255,.05);
-    `;
-    authorInfo.innerHTML = `
-      <div style="font-weight:700; margin-bottom:2px;">作者：伍壹51</div>
-      <div style="opacity:.85;">X: <a href="https://x.com/0x515151" target="_blank" style="color:#60a5fa; text-decoration:none;">@0x515151</a></div>
-      <div style="opacity:.85;">TradeGenius: <a href="https://www.tradegenius.com/ref/8C2TSF" target="_blank" style="color:#60a5fa; text-decoration:none;">直達鏈結</a></div>
-    `;
+    authorInfo.style.cssText = 'font-size:11px; opacity:.75; margin-bottom:8px; padding:6px 8px; border-radius:8px; background: rgba(0,0,0,.15); border: 1px solid rgba(255,255,255,.05);';
+    authorInfo.innerHTML = '<div style="font-weight:700; margin-bottom:2px;">作者：伍壹51</div><div style="opacity:.85;">X: <a href="https://x.com/0x515151" target="_blank" style="color:#60a5fa; text-decoration:none;">@0x515151</a></div><div style="opacity:.85;">TradeGenius: <a href="https://www.tradegenius.com/ref/8C2TSF" target="_blank" style="color:#60a5fa; text-decoration:none;">直達鏈結</a></div>';
 
     const swapTip = document.createElement('div');
-    swapTip.style.cssText = `font-size:11px; opacity:.85; margin-bottom:8px;`;
+    swapTip.style.cssText = 'font-size:11px; opacity:.85; margin-bottom:8px;';
     swapTip.textContent = 'Tip: 先確保頁面手動可交易（MAX/Confirm 不灰）再開，全程使用英文介面。';
 
     const swapLog = document.createElement('pre');
-    swapLog.style.cssText = `
-      margin:0; padding:8px; border-radius:10px;
-      background: rgba(0,0,0,.25);
-      font-size:11px; line-height:1.35;
-      white-space: pre-wrap; word-break: break-word;
-      max-height: 120px; overflow:auto;
-    `;
+    swapLog.style.cssText = 'margin:0; padding:8px; border-radius:10px; background: rgba(0,0,0,.25); font-size:11px; line-height:1.35; white-space: pre-wrap; word-break: break-word; max-height: 120px; overflow:auto;';
     swapLog.textContent = 'Ready.\n';
 
-    swapBody.appendChild(authorInfo);  // 作者資訊放最上面
+    swapBody.appendChild(authorInfo);
     swapBody.appendChild(swapTip);
     swapBody.appendChild(swapLog);
 
     // ========= Refresh Section =========
     const refreshHeader = document.createElement('div');
-    refreshHeader.style.cssText = `padding: 10px 12px; display:flex; gap:10px; align-items:center; border-bottom: 1px solid rgba(255,255,255,.08);`;
+    refreshHeader.style.cssText = 'padding: 10px 12px; display:flex; gap:10px; align-items:center; border-bottom: 1px solid rgba(255,255,255,.08);';
 
     const refreshDot = document.createElement('span');
-    refreshDot.style.cssText = `width:10px; height:10px; border-radius:999px; background:#16a34a; display:inline-block;`;
+    refreshDot.style.cssText = 'width:10px; height:10px; border-radius:999px; background:#16a34a; display:inline-block;';
 
     const refreshTitleWrap = document.createElement('div');
-    refreshTitleWrap.style.cssText = `display:flex; flex-direction:column; line-height:1.15;`;
+    refreshTitleWrap.style.cssText = 'display:flex; flex-direction:column; line-height:1.15;';
 
     const refreshTitle = document.createElement('div');
     refreshTitle.textContent = 'Auto Refresh';
-    refreshTitle.style.cssText = `font-weight:700; font-size:13px;`;
+    refreshTitle.style.cssText = 'font-weight:700; font-size:13px;';
 
     const refreshStatus = document.createElement('div');
     refreshStatus.textContent = 'RUNNING';
-    refreshStatus.style.cssText = `font-size:12px; opacity:.9;`;
+    refreshStatus.style.cssText = 'font-size:12px; opacity:.9;';
 
     refreshTitleWrap.appendChild(refreshTitle);
     refreshTitleWrap.appendChild(refreshStatus);
@@ -217,38 +195,30 @@
     refreshHeader.appendChild(refreshTitleWrap);
 
     const refreshBody = document.createElement('div');
-    refreshBody.style.cssText = `padding: 10px 12px;`;
+    refreshBody.style.cssText = 'padding: 10px 12px;';
 
     const refreshNext = document.createElement('div');
-    refreshNext.style.cssText = `margin-bottom:6px; opacity:.9; font-size:12px;`;
+    refreshNext.style.cssText = 'margin-bottom:6px; opacity:.9; font-size:12px;';
     refreshNext.textContent = 'Next: -';
 
     const refreshLeft = document.createElement('div');
-    refreshLeft.style.cssText = `margin-bottom:10px; opacity:.9; font-size:12px;`;
+    refreshLeft.style.cssText = 'margin-bottom:10px; opacity:.9; font-size:12px;';
     refreshLeft.textContent = 'Left: -';
 
     const refreshBtnRow = document.createElement('div');
-    refreshBtnRow.style.cssText = `display:flex; gap:8px;`;
+    refreshBtnRow.style.cssText = 'display:flex; gap:8px;';
 
     const refreshBtnToggle = document.createElement('button');
-    refreshBtnToggle.style.cssText = `
-      flex:1; border:0; cursor:pointer; color:white;
-      background:#dc2626; padding:8px 10px; border-radius:10px;
-      font-weight:700; font-size:12px;
-    `;
+    refreshBtnToggle.style.cssText = 'flex:1; border:0; cursor:pointer; color:white; background:#dc2626; padding:8px 10px; border-radius:10px; font-weight:700; font-size:12px;';
     refreshBtnToggle.textContent = 'Pause (Ctrl+Alt+R)';
 
     const refreshBtnNow = document.createElement('button');
-    refreshBtnNow.style.cssText = `
-      flex:1; border:0; cursor:pointer; color:white;
-      background:#2563eb; padding:8px 10px; border-radius:10px;
-      font-weight:700; font-size:12px;
-    `;
+    refreshBtnNow.style.cssText = 'flex:1; border:0; cursor:pointer; color:white; background:#2563eb; padding:8px 10px; border-radius:10px; font-weight:700; font-size:12px;';
     refreshBtnNow.textContent = 'Refresh now';
 
     const refreshTip = document.createElement('div');
-    refreshTip.style.cssText = `margin-top:10px; font-size:11px; opacity:.65; line-height:1.35;`;
-    refreshTip.textContent = `Interval: random ${REFRESH_CONFIG.MIN_MINUTES}–${REFRESH_CONFIG.MAX_MINUTES} minutes`;
+    refreshTip.style.cssText = 'margin-top:10px; font-size:11px; opacity:.65; line-height:1.35;';
+    refreshTip.textContent = 'Interval: random ' + REFRESH_CONFIG.MIN_MINUTES + '–' + REFRESH_CONFIG.MAX_MINUTES + ' minutes';
 
     refreshBtnRow.appendChild(refreshBtnToggle);
     refreshBtnRow.appendChild(refreshBtnNow);
@@ -405,7 +375,7 @@
         const balanceMatch = balanceText.match(/[\d,\.]+/);
         if (balanceMatch) {
           const balance = parseFloat(balanceMatch[0].replace(/,/g, ''));
-          UI.logSwap(`发现 ${symbol}: ${balance}`);
+          UI.logSwap('发现 ' + symbol + ': ' + balance);
           if (balance > maxBalance) {
             maxBalance = balance;
             targetRow = row;
@@ -418,7 +388,7 @@
     if (targetRow) {
       targetRow.click();
       selectedFromToken = targetSymbol;
-      UI.logSwap(`✅ From 选择了 ${targetSymbol} (余额: ${maxBalance})`);
+      UI.logSwap('✅ From 选择了 ' + targetSymbol + ' (余额: ' + maxBalance + ')');
       return true;
     }
 
@@ -430,7 +400,7 @@
     await sleep(SWAP_CONFIG.waitAfterChoose);
 
     const targetToken = selectedFromToken === 'USDT' ? 'USDC' : 'USDT';
-    UI.logSwap(`From 是 ${selectedFromToken}，Receive 选择 ${targetToken}`);
+    UI.logSwap('From 是 ' + selectedFromToken + '，Receive 选择 ' + targetToken);
 
     const tabs = document.querySelectorAll('[role="dialog"] .flex.flex-row.gap-3 > div');
     let stableTab = null;
@@ -454,7 +424,7 @@
       const symbol = symbolEl?.innerText?.trim();
 
       if (symbol === targetToken) {
-        UI.logSwap(`找到 ${symbol}，尝试选择 BNB 链...`);
+        UI.logSwap('找到 ' + symbol + '，尝试选择 BNB 链...');
 
         row.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
         await sleep(SWAP_CONFIG.waitForHover);
@@ -466,19 +436,19 @@
             const chainName = opt.querySelector('span')?.innerText?.trim();
             if (chainName === 'BNB' || chainName === 'Binance') {
               opt.click();
-              UI.logSwap(`✅ Receive 选择了 ${symbol} (BNB链)`);
+              UI.logSwap('✅ Receive 选择了 ' + symbol + ' (BNB链)');
               return true;
             }
           }
         }
 
         row.click();
-        UI.logSwap(`✅ Receive 直接选择了 ${symbol}`);
+        UI.logSwap('✅ Receive 直接选择了 ' + symbol);
         return true;
       }
     }
 
-    UI.logSwap(`⚠️ 未找到 ${targetToken}`);
+    UI.logSwap('⚠️ 未找到 ' + targetToken);
     return false;
   }
 
@@ -489,15 +459,16 @@
     }
     window.botRunning = true;
     isSwapRunning = true;
+    localStorage.setItem(SWAP_CONFIG.KEY_SWAP_ENABLED, '1');
     UI.setSwapRunning(true);
 
-    UI.logSwap(`🚀 Bot started. 区间: ${SWAP_CONFIG.waitRandomMin/1000}s - ${SWAP_CONFIG.waitRandomMax/1000}s`);
+    UI.logSwap('🚀 Bot started. 区间: ' + (SWAP_CONFIG.waitRandomMin/1000) + 's - ' + (SWAP_CONFIG.waitRandomMax/1000) + 's');
 
     await sleep(SWAP_CONFIG.waitBeforeStart);
 
     while (isSwapRunning) {
       try {
-        UI.logSwap(`--- 新循环 ${new Date().toLocaleTimeString()} ---`);
+        UI.logSwap('--- 新循环 ' + new Date().toLocaleTimeString() + ' ---');
 
         const closeBtn = findCloseBtn();
         if (closeBtn) {
@@ -509,7 +480,7 @@
 
         const chooseBtns = findChooseBtns();
         if (chooseBtns.length > 0) {
-          UI.logSwap(`📌 检测到 ${chooseBtns.length} 个 Choose，开始选币...`);
+          UI.logSwap('📌 检测到 ' + chooseBtns.length + ' 个 Choose，开始选币...');
 
           selectedFromToken = null;
 
@@ -570,7 +541,7 @@
           const btnConfirm = findConfirmBtn();
           if (btnConfirm && !btnConfirm.disabled) {
             btnConfirm.click();
-            UI.logSwap(`✅ 点击 Confirm (第 ${i + 1} 次)`);
+            UI.logSwap('✅ 点击 Confirm (第 ' + (i + 1) + ' 次)');
             confirmClicked = true;
             break;
           }
@@ -594,7 +565,7 @@
           }
 
           const randomWait = getRandomTime(SWAP_CONFIG.waitRandomMin, SWAP_CONFIG.waitRandomMax);
-          UI.logSwap(`🎲 随机休息 ${(randomWait / 1000).toFixed(1)} 秒...`);
+          UI.logSwap('🎲 随机休息 ' + (randomWait / 1000).toFixed(1) + ' 秒...');
           await sleep(randomWait);
         } else {
           UI.logSwap("⚠️ Confirm 未成功，短休后重试...");
@@ -615,6 +586,7 @@
   function stopSwapLoop() {
     isSwapRunning = false;
     window.botRunning = false;
+    localStorage.setItem(SWAP_CONFIG.KEY_SWAP_ENABLED, '0');
     UI.setSwapRunning(false);
     UI.logSwap("🛑 stop() called");
   }
@@ -636,7 +608,16 @@
     mountUI();
     if (refreshEnabled) scheduleRefresh();
     else UI.renderRefresh();
-    UI.logSwap('Loaded. Click Start or press Ctrl+Alt+S.');
+
+    // 如果刷新前 Swap Bot 是運行的，自動重啟
+    if (swapEnabled) {
+      UI.logSwap('🔄 檢測到頁面刷新前 Bot 正在運行，自動恢復中...');
+      setTimeout(() => {
+        window.startBot();
+      }, 2000);
+    } else {
+      UI.logSwap('Loaded. Click Start or press Ctrl+Alt+S.');
+    }
   }
 
   if (document.readyState === 'loading') {
