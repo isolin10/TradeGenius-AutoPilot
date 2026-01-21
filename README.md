@@ -1,3 +1,10 @@
+2026/01/20 v2.0.1 update :
+1.修正了新功能衝突問題
+
+2026/01/19 v2.0.0 update :
+1.增加隨機延遲交互功能
+2.增加隨機延遲防前端卡頓
+
 # TradeGenius AutoPilot
 
 **自動交互執行機器人（Public Edition）**  

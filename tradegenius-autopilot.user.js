@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Auto Swap Bot
+// @name         Auto Swap Bot + Random Auto Refresh
 // @namespace    https://hunter-association.io
-// @version      1.0.1
-// @description  Automated swap execution script
+// @version      2.1.0
+// @description  Automated swap execution with random auto-refresh (20-40min) - Fixed auto-resume after refresh
 // @author       伍壹51
 // @homepage     https://x.com/0x515151
 // @match        https://www.tradegenius.com/trade
@@ -13,34 +13,105 @@
 (function () {
   'use strict';
 
-  // ========= 使用說明 =========
-  // 1) 把上面的 @match 改成你的 DApp 網址網域，例如：
-  //    @match https://app.example.com/*
-  // 2) 進入該網站後，右下角會出現面板，按 Start 開始跑
-  // 3) 熱鍵 Ctrl + Alt + S 開關
-  // 4) 停止可按 Stop，或 console 輸入 stopBot()
-
   // ========= 小保護：只在頂層頁面跑（避免 iframe 重複啟動）=========
   if (window.top !== window.self) return;
 
-  // ========= UI 面板 =========
+  // ========= Auto Refresh 配置 =========
+  const REFRESH_CONFIG = {
+    MIN_MINUTES: 20,
+    MAX_MINUTES: 40,
+    KEY_ENABLED: 'tg_rand_refresh_enabled',
+    KEY_NEXT_AT: 'tg_rand_refresh_next_at',
+  };
+
+  const MIN_MS = REFRESH_CONFIG.MIN_MINUTES * 60 * 1000;
+  const MAX_MS = REFRESH_CONFIG.MAX_MINUTES * 60 * 1000;
+
+  // ========= Auto Swap 配置 =========
+  const SWAP_CONFIG = {
+    waitAfterMax: 1000,
+    maxRetryConfirm: 20,
+    waitAfterConfirm: 3000,
+    waitAfterFixSwitch: 2000,
+    waitRandomMin: 12000,
+    waitRandomMax: 25000,
+    waitAfterClose: 1500,
+    waitAfterChoose: 1000,
+    waitAfterTokenSelect: 1500,
+    waitAfterTabClick: 800,
+    waitForHover: 500,
+    waitBeforeStart: 1200,
+    KEY_SWAP_ENABLED: 'tg_swap_enabled',
+  };
+
+  // ========= 共用工具函數 =========
+  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+  const randDelay = () => randInt(MIN_MS, MAX_MS);
+  const getRandomTime = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+  const fmtTime = (ts) => new Date(ts).toLocaleTimeString();
+  const fmtLeft = (ms) => {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return String(m).padStart(2, '0') + ':' + String(r).padStart(2, '0');
+  };
+
+  // ========= Swap Bot 變數 =========
+  let swapEnabled = localStorage.getItem(SWAP_CONFIG.KEY_SWAP_ENABLED);
+  swapEnabled = swapEnabled === '1';
+  let isSwapRunning = false;
+  let selectedFromToken = null;
+  let loopPromise = null;
+
+  // ========= Auto Refresh 變數 =========
+  let refreshEnabled = localStorage.getItem(REFRESH_CONFIG.KEY_ENABLED);
+  refreshEnabled = refreshEnabled === null ? true : refreshEnabled === '1';
+  let refreshTimerId = null;
+  let refreshTickerId = null;
+
+  // ========= 合併 UI 面板 =========
   const UI = {
     root: null,
-    statusDot: null,
-    statusText: null,
-    btnToggle: null,
-    logEl: null,
-    setRunning(running) {
+    // Swap Bot UI
+    swapStatusDot: null,
+    swapStatusText: null,
+    swapBtnToggle: null,
+    swapLogEl: null,
+    // Refresh UI
+    refreshDot: null,
+    refreshStatus: null,
+    refreshNextEl: null,
+    refreshLeftEl: null,
+    refreshBtnToggle: null,
+    refreshBtnNow: null,
+
+    setSwapRunning(running) {
       if (!this.root) return;
-      this.statusDot.style.background = running ? '#16a34a' : '#dc2626';
-      this.statusText.textContent = running ? 'RUNNING' : 'STOPPED';
-      this.btnToggle.textContent = running ? 'Stop (Ctrl+Alt+S)' : 'Start (Ctrl+Alt+S)';
-      this.btnToggle.style.background = running ? '#dc2626' : '#16a34a';
+      this.swapStatusDot.style.background = running ? '#16a34a' : '#dc2626';
+      this.swapStatusText.textContent = running ? 'RUNNING' : 'STOPPED';
+      this.swapBtnToggle.textContent = running ? 'Stop (Ctrl+Alt+S)' : 'Start (Ctrl+Alt+S)';
+      this.swapBtnToggle.style.background = running ? '#dc2626' : '#16a34a';
     },
-    log(msg) {
-      if (!this.logEl) return;
+
+    logSwap(msg) {
+      if (!this.swapLogEl) return;
       const t = new Date().toLocaleTimeString();
-      this.logEl.textContent = `[${t}] ${msg}\n` + this.logEl.textContent.slice(0, 1200);
+      this.swapLogEl.textContent = '[' + t + '] ' + msg + '\n' + this.swapLogEl.textContent.slice(0, 1200);
+    },
+
+    renderRefresh(nextAt) {
+      const isOn = refreshEnabled;
+      this.refreshDot.style.background = isOn ? '#16a34a' : '#dc2626';
+      this.refreshStatus.textContent = isOn ? 'RUNNING' : 'PAUSED';
+      this.refreshBtnToggle.textContent = isOn ? 'Pause (Ctrl+Alt+R)' : 'Resume (Ctrl+Alt+R)';
+      this.refreshBtnToggle.style.background = isOn ? '#dc2626' : '#16a34a';
+
+      const at = nextAt ?? Number(localStorage.getItem(REFRESH_CONFIG.KEY_NEXT_AT) || 0);
+      this.refreshNextEl.textContent = at ? 'Next: ' + fmtTime(at) : 'Next: -';
+
+      const leftMs = at ? (at - Date.now()) : 0;
+      this.refreshLeftEl.textContent = at ? 'Left: ' + fmtLeft(leftMs) : 'Left: -';
     }
   };
 
@@ -48,115 +119,211 @@
     if (UI.root) return;
 
     const root = document.createElement('div');
-    root.style.cssText = `
-      position: fixed; right: 16px; bottom: 16px; z-index: 999999;
-      width: 260px; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      border-radius: 12px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,.25);
-      background: rgba(17, 24, 39, .92); color: #e5e7eb; backdrop-filter: blur(8px);
-    `;
+    root.style.cssText = 'position: fixed; right: 16px; bottom: 16px; z-index: 999999; width: 300px; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; border-radius: 12px; overflow: hidden; background: rgba(17,24,39,.92); color: #e5e7eb; backdrop-filter: blur(8px); box-shadow: 0 10px 30px rgba(0,0,0,.25);';
 
-    const header = document.createElement('div');
-    header.style.cssText = `padding: 10px 12px; display:flex; align-items:center; gap:10px; border-bottom: 1px solid rgba(255,255,255,.08);`;
+    // ========= Swap Bot Section =========
+    const swapHeader = document.createElement('div');
+    swapHeader.style.cssText = 'padding: 10px 12px; display:flex; align-items:center; gap:10px; border-bottom: 1px solid rgba(255,255,255,.08);';
 
-    const dot = document.createElement('span');
-    dot.style.cssText = `width:10px; height:10px; border-radius:999px; background:#dc2626; display:inline-block;`;
+    const swapDot = document.createElement('span');
+    swapDot.style.cssText = 'width:10px; height:10px; border-radius:999px; background:#dc2626; display:inline-block;';
 
-    const titleWrap = document.createElement('div');
-    titleWrap.style.cssText = `display:flex; flex-direction:column; line-height:1.15;`;
+    const swapTitleWrap = document.createElement('div');
+    swapTitleWrap.style.cssText = 'display:flex; flex-direction:column; line-height:1.15;';
 
-    const title = document.createElement('div');
-    title.textContent = 'AutoSwap';
+    const swapTitle = document.createElement('div');
+    swapTitle.textContent = 'AutoSwap Bot';
+    swapTitle.style.cssText = 'font-weight:700; font-size:13px;';
 
-const author = document.createElement('div');
-author.innerHTML = `
-  <div style="font-size:11px; opacity:.75;">伍壹51</div>
-  <div style="font-size:11px; opacity:.65;">X：0x515151</div>
-`;
-author.style.marginTop = '2px';
+    const swapStatus = document.createElement('div');
+    swapStatus.textContent = 'STOPPED';
+    swapStatus.style.cssText = 'font-size:12px; opacity:.9;';
 
-titleWrap.appendChild(author);
+    swapTitleWrap.appendChild(swapTitle);
+    swapTitleWrap.appendChild(swapStatus);
 
-    title.style.cssText = `font-weight:700; font-size:13px;`;
+    const swapBtn = document.createElement('button');
+    swapBtn.textContent = 'Start (Ctrl+Alt+S)';
+    swapBtn.style.cssText = 'margin-left:auto; border:0; cursor:pointer; color:white; background:#16a34a; padding:8px 10px; border-radius:10px; font-weight:700; font-size:12px;';
 
-    const status = document.createElement('div');
-    status.textContent = 'STOPPED';
-    status.style.cssText = `font-size:12px; opacity:.9;`;
+    swapHeader.appendChild(swapDot);
+    swapHeader.appendChild(swapTitleWrap);
+    swapHeader.appendChild(swapBtn);
 
-    titleWrap.appendChild(title);
-    titleWrap.appendChild(status);
+    const swapBody = document.createElement('div');
+    swapBody.style.cssText = 'padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.08);';
 
-    const btn = document.createElement('button');
-    btn.textContent = 'Start (Ctrl+Alt+S)';
-    btn.style.cssText = `
-      margin-left:auto; border:0; cursor:pointer; color:white;
-      background:#16a34a; padding:8px 10px; border-radius:10px;
-      font-weight:700; font-size:12px;
-    `;
+    // ========= Author Info =========
+    const authorInfo = document.createElement('div');
+    authorInfo.style.cssText = 'font-size:11px; opacity:.75; margin-bottom:8px; padding:6px 8px; border-radius:8px; background: rgba(0,0,0,.15); border: 1px solid rgba(255,255,255,.05);';
+    authorInfo.innerHTML = '<div style="font-weight:700; margin-bottom:2px;">作者：伍壹51</div><div style="opacity:.85;">X: <a href="https://x.com/0x515151" target="_blank" style="color:#60a5fa; text-decoration:none;">@0x515151</a></div><div style="opacity:.85;">TradeGenius: <a href="https://www.tradegenius.com/ref/8C2TSF" target="_blank" style="color:#60a5fa; text-decoration:none;">直達鏈結</a></div>';
 
-    const body = document.createElement('div');
-    body.style.cssText = `padding: 10px 12px;`;
+    const swapTip = document.createElement('div');
+    swapTip.style.cssText = 'font-size:11px; opacity:.85; margin-bottom:8px;';
+    swapTip.textContent = 'Tip: 先確保頁面手動可交易（MAX/Confirm 不灰）再開，全程使用英文介面。';
 
-    const tip = document.createElement('div');
-    tip.style.cssText = `font-size:12px; opacity:.85; margin-bottom:8px;`;
-    tip.textContent = 'Tip: 先確保頁面手動可交易（MAX/Confirm 不灰）再開，全程使用EN介面。';
+    const swapLog = document.createElement('pre');
+    swapLog.style.cssText = 'margin:0; padding:8px; border-radius:10px; background: rgba(0,0,0,.25); font-size:11px; line-height:1.35; white-space: pre-wrap; word-break: break-word; max-height: 120px; overflow:auto;';
+    swapLog.textContent = 'Ready.\n';
 
-    const log = document.createElement('pre');
-    log.style.cssText = `
-      margin:0; padding:8px; border-radius:10px;
-      background: rgba(0,0,0,.25);
-      font-size:11px; line-height:1.35;
-      white-space: pre-wrap; word-break: break-word;
-      max-height: 140px; overflow:auto;
-    `;
-    log.textContent = 'Ready.\n';
+    swapBody.appendChild(authorInfo);
+    swapBody.appendChild(swapTip);
+    swapBody.appendChild(swapLog);
 
-    body.appendChild(tip);
-    body.appendChild(log);
+    // ========= Refresh Section =========
+    const refreshHeader = document.createElement('div');
+    refreshHeader.style.cssText = 'padding: 10px 12px; display:flex; gap:10px; align-items:center; border-bottom: 1px solid rgba(255,255,255,.08);';
 
-    header.appendChild(dot);
-    header.appendChild(titleWrap);
-    header.appendChild(btn);
+    const refreshDot = document.createElement('span');
+    refreshDot.style.cssText = 'width:10px; height:10px; border-radius:999px; background:#16a34a; display:inline-block;';
 
-    root.appendChild(header);
-    root.appendChild(body);
+    const refreshTitleWrap = document.createElement('div');
+    refreshTitleWrap.style.cssText = 'display:flex; flex-direction:column; line-height:1.15;';
+
+    const refreshTitle = document.createElement('div');
+    refreshTitle.textContent = 'Auto Refresh';
+    refreshTitle.style.cssText = 'font-weight:700; font-size:13px;';
+
+    const refreshStatus = document.createElement('div');
+    refreshStatus.textContent = 'RUNNING';
+    refreshStatus.style.cssText = 'font-size:12px; opacity:.9;';
+
+    refreshTitleWrap.appendChild(refreshTitle);
+    refreshTitleWrap.appendChild(refreshStatus);
+
+    refreshHeader.appendChild(refreshDot);
+    refreshHeader.appendChild(refreshTitleWrap);
+
+    const refreshBody = document.createElement('div');
+    refreshBody.style.cssText = 'padding: 10px 12px;';
+
+    const refreshNext = document.createElement('div');
+    refreshNext.style.cssText = 'margin-bottom:6px; opacity:.9; font-size:12px;';
+    refreshNext.textContent = 'Next: -';
+
+    const refreshLeft = document.createElement('div');
+    refreshLeft.style.cssText = 'margin-bottom:10px; opacity:.9; font-size:12px;';
+    refreshLeft.textContent = 'Left: -';
+
+    const refreshBtnRow = document.createElement('div');
+    refreshBtnRow.style.cssText = 'display:flex; gap:8px;';
+
+    const refreshBtnToggle = document.createElement('button');
+    refreshBtnToggle.style.cssText = 'flex:1; border:0; cursor:pointer; color:white; background:#dc2626; padding:8px 10px; border-radius:10px; font-weight:700; font-size:12px;';
+    refreshBtnToggle.textContent = 'Pause (Ctrl+Alt+R)';
+
+    const refreshBtnNow = document.createElement('button');
+    refreshBtnNow.style.cssText = 'flex:1; border:0; cursor:pointer; color:white; background:#2563eb; padding:8px 10px; border-radius:10px; font-weight:700; font-size:12px;';
+    refreshBtnNow.textContent = 'Refresh now';
+
+    const refreshTip = document.createElement('div');
+    refreshTip.style.cssText = 'margin-top:10px; font-size:11px; opacity:.65; line-height:1.35;';
+    refreshTip.textContent = 'Interval: random ' + REFRESH_CONFIG.MIN_MINUTES + '–' + REFRESH_CONFIG.MAX_MINUTES + ' minutes';
+
+    refreshBtnRow.appendChild(refreshBtnToggle);
+    refreshBtnRow.appendChild(refreshBtnNow);
+
+    refreshBody.appendChild(refreshNext);
+    refreshBody.appendChild(refreshLeft);
+    refreshBody.appendChild(refreshBtnRow);
+    refreshBody.appendChild(refreshTip);
+
+    // ========= Assemble UI =========
+    root.appendChild(swapHeader);
+    root.appendChild(swapBody);
+    root.appendChild(refreshHeader);
+    root.appendChild(refreshBody);
+
     document.body.appendChild(root);
 
     UI.root = root;
-    UI.statusDot = dot;
-    UI.statusText = status;
-    UI.btnToggle = btn;
-    UI.logEl = log;
+    UI.swapStatusDot = swapDot;
+    UI.swapStatusText = swapStatus;
+    UI.swapBtnToggle = swapBtn;
+    UI.swapLogEl = swapLog;
+    UI.refreshDot = refreshDot;
+    UI.refreshStatus = refreshStatus;
+    UI.refreshNextEl = refreshNext;
+    UI.refreshLeftEl = refreshLeft;
+    UI.refreshBtnToggle = refreshBtnToggle;
+    UI.refreshBtnNow = refreshBtnNow;
 
-    UI.setRunning(false);
+    UI.setSwapRunning(false);
+    UI.renderRefresh();
+
+    // ========= Event Listeners =========
+    swapBtn.addEventListener('click', toggleSwap);
+    refreshBtnToggle.addEventListener('click', toggleRefresh);
+    refreshBtnNow.addEventListener('click', () => doReload('manual'));
+
+    window.addEventListener('keydown', (e) => {
+      // Ctrl + Alt + S: Toggle Swap Bot
+      if (e.ctrlKey && e.altKey && (e.key === 's' || e.key === 'S')) {
+        e.preventDefault();
+        toggleSwap();
+      }
+      // Ctrl + Alt + R: Toggle Auto Refresh
+      if (e.ctrlKey && e.altKey && (e.key === 'r' || e.key === 'R')) {
+        e.preventDefault();
+        toggleRefresh();
+      }
+    });
   }
 
-  // ========= 原脚本：配置 =========
-  const CONFIG = {
-    waitAfterMax: 1000,
-    maxRetryConfirm: 20,
-    waitAfterConfirm: 3000,
-    waitAfterFixSwitch: 2000,
-    waitRandomMin: 12000,
-    waitRandomMax: 25000,
+  // ========= Auto Refresh Functions =========
+  function clearRefreshTimers() {
+    if (refreshTimerId) clearTimeout(refreshTimerId);
+    if (refreshTickerId) clearInterval(refreshTickerId);
+    refreshTimerId = null;
+    refreshTickerId = null;
+  }
 
-    waitAfterClose: 1500,
-    waitAfterChoose: 1000,
-    waitAfterTokenSelect: 1500,
-    waitAfterTabClick: 800,
-    waitForHover: 500,
+  function setNextAt(ts) {
+    localStorage.setItem(REFRESH_CONFIG.KEY_NEXT_AT, String(ts));
+    UI.renderRefresh(ts);
+  }
 
-    // 新增：啟動前等待頁面穩定
-    waitBeforeStart: 1200,
-  };
+  function scheduleRefresh() {
+    clearRefreshTimers();
 
-  let isRunning = false;
-  let selectedFromToken = null;
-  let loopPromise = null;
+    let nextAt = Number(localStorage.getItem(REFRESH_CONFIG.KEY_NEXT_AT) || 0);
+    const now = Date.now();
 
-  // ========= 工具函数 =========
-  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-  const getRandomTime = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+    if (!nextAt || nextAt < now + 2000) {
+      nextAt = now + randDelay();
+      setNextAt(nextAt);
+    }
 
+    refreshTickerId = setInterval(() => {
+      UI.renderRefresh(nextAt);
+    }, 1000);
+
+    const wait = Math.max(0, nextAt - now);
+    refreshTimerId = setTimeout(() => doReload('timer'), wait);
+  }
+
+  function doReload(reason) {
+    const nextAt = Date.now() + randDelay();
+    setNextAt(nextAt);
+
+    sleep(150).then(() => {
+      location.reload();
+    });
+  }
+
+  function setRefreshEnabled(v) {
+    refreshEnabled = v;
+    localStorage.setItem(REFRESH_CONFIG.KEY_ENABLED, v ? '1' : '0');
+    if (refreshEnabled) scheduleRefresh();
+    else clearRefreshTimers();
+    UI.renderRefresh();
+  }
+
+  function toggleRefresh() {
+    setRefreshEnabled(!refreshEnabled);
+  }
+
+  // ========= Swap Bot Functions =========
   function findCloseBtn() {
     return Array.from(document.querySelectorAll('button'))
       .find(b => b.innerText.trim().toUpperCase() === 'CLOSE' &&
@@ -191,9 +358,8 @@ titleWrap.appendChild(author);
     return !!document.querySelector('[role="dialog"][data-state="open"]');
   }
 
-  // ========= 代币选择函数 =========
   async function selectMaxBalanceToken() {
-    await sleep(CONFIG.waitAfterChoose);
+    await sleep(SWAP_CONFIG.waitAfterChoose);
 
     const tokenRows = document.querySelectorAll('[role="dialog"] .cursor-pointer');
     let maxBalance = -1;
@@ -209,7 +375,7 @@ titleWrap.appendChild(author);
         const balanceMatch = balanceText.match(/[\d,\.]+/);
         if (balanceMatch) {
           const balance = parseFloat(balanceMatch[0].replace(/,/g, ''));
-          UI.log(`发现 ${symbol}: ${balance}`);
+          UI.logSwap('发现 ' + symbol + ': ' + balance);
           if (balance > maxBalance) {
             maxBalance = balance;
             targetRow = row;
@@ -222,21 +388,20 @@ titleWrap.appendChild(author);
     if (targetRow) {
       targetRow.click();
       selectedFromToken = targetSymbol;
-      UI.log(`✅ From 选择了 ${targetSymbol} (余额: ${maxBalance})`);
+      UI.logSwap('✅ From 选择了 ' + targetSymbol + ' (余额: ' + maxBalance + ')');
       return true;
     }
 
-    UI.log("⚠️ 未找到 USDT/USDC");
+    UI.logSwap("⚠️ 未找到 USDT/USDC");
     return false;
   }
 
   async function selectReceiveToken() {
-    await sleep(CONFIG.waitAfterChoose);
+    await sleep(SWAP_CONFIG.waitAfterChoose);
 
     const targetToken = selectedFromToken === 'USDT' ? 'USDC' : 'USDT';
-    UI.log(`From 是 ${selectedFromToken}，Receive 选择 ${targetToken}`);
+    UI.logSwap('From 是 ' + selectedFromToken + '，Receive 选择 ' + targetToken);
 
-    // 点击 Stable 标签
     const tabs = document.querySelectorAll('[role="dialog"] .flex.flex-row.gap-3 > div');
     let stableTab = null;
     tabs.forEach(tab => {
@@ -245,10 +410,10 @@ titleWrap.appendChild(author);
 
     if (stableTab) {
       stableTab.click();
-      UI.log("点击 Stable 标签");
-      await sleep(CONFIG.waitAfterTabClick);
+      UI.logSwap("点击 Stable 标签");
+      await sleep(SWAP_CONFIG.waitAfterTabClick);
     } else {
-      UI.log("未找到 Stable 标签，尝试直接选择");
+      UI.logSwap("未找到 Stable 标签，尝试直接选择");
     }
 
     await sleep(300);
@@ -259,13 +424,11 @@ titleWrap.appendChild(author);
       const symbol = symbolEl?.innerText?.trim();
 
       if (symbol === targetToken) {
-        UI.log(`找到 ${symbol}，尝试选择 BNB 链...`);
+        UI.logSwap('找到 ' + symbol + '，尝试选择 BNB 链...');
 
-        // 触发悬停
         row.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-        await sleep(CONFIG.waitForHover);
+        await sleep(SWAP_CONFIG.waitForHover);
 
-        // hover 菜单（若网站使用 portal，这里可能抓不到，会走 fallback）
         const chainMenu = row.querySelector('.genius-shadow');
         if (chainMenu) {
           const chainOptions = chainMenu.querySelectorAll('.cursor-pointer');
@@ -273,200 +436,190 @@ titleWrap.appendChild(author);
             const chainName = opt.querySelector('span')?.innerText?.trim();
             if (chainName === 'BNB' || chainName === 'Binance') {
               opt.click();
-              UI.log(`✅ Receive 选择了 ${symbol} (BNB链)`);
+              UI.logSwap('✅ Receive 选择了 ' + symbol + ' (BNB链)');
               return true;
             }
           }
         }
 
-        // fallback：直接点 token
         row.click();
-        UI.log(`✅ Receive 直接选择了 ${symbol}`);
+        UI.logSwap('✅ Receive 直接选择了 ' + symbol);
         return true;
       }
     }
 
-    UI.log(`⚠️ 未找到 ${targetToken}`);
+    UI.logSwap('⚠️ 未找到 ' + targetToken);
     return false;
   }
 
-  // ========= 主循环 =========
-  async function startLoop() {
+  async function startSwapLoop() {
     if (window.botRunning) {
-      UI.log("⚠️ 脚本已经在运行了！");
+      UI.logSwap("⚠️ 脚本已经在运行了！");
       return;
     }
     window.botRunning = true;
-    isRunning = true;
-    UI.setRunning(true);
+    isSwapRunning = true;
+    localStorage.setItem(SWAP_CONFIG.KEY_SWAP_ENABLED, '1');
+    UI.setSwapRunning(true);
 
-    UI.log(`🚀 Bot started. 区间: ${CONFIG.waitRandomMin/1000}s - ${CONFIG.waitRandomMax/1000}s`);
+    UI.logSwap('🚀 Bot started. 区间: ' + (SWAP_CONFIG.waitRandomMin/1000) + 's - ' + (SWAP_CONFIG.waitRandomMax/1000) + 's');
 
-    await sleep(CONFIG.waitBeforeStart);
+    await sleep(SWAP_CONFIG.waitBeforeStart);
 
-    while (isRunning) {
+    while (isSwapRunning) {
       try {
-        UI.log(`--- 新循环 ${new Date().toLocaleTimeString()} ---`);
+        UI.logSwap('--- 新循环 ' + new Date().toLocaleTimeString() + ' ---');
 
-        // Step 0: close
         const closeBtn = findCloseBtn();
         if (closeBtn) {
           closeBtn.click();
-          UI.log("✅ 关闭交易完成弹窗");
-          await sleep(CONFIG.waitAfterClose);
+          UI.logSwap("✅ 关闭交易完成弹窗");
+          await sleep(SWAP_CONFIG.waitAfterClose);
           continue;
         }
 
-        // Step 0.5: choose tokens
         const chooseBtns = findChooseBtns();
         if (chooseBtns.length > 0) {
-          UI.log(`📌 检测到 ${chooseBtns.length} 个 Choose，开始选币...`);
+          UI.logSwap('📌 检测到 ' + chooseBtns.length + ' 个 Choose，开始选币...');
 
           selectedFromToken = null;
 
           chooseBtns[0].click();
-          UI.log("点击第一个 Choose (From)");
-          await sleep(CONFIG.waitAfterChoose);
+          UI.logSwap("点击第一个 Choose (From)");
+          await sleep(SWAP_CONFIG.waitAfterChoose);
 
           if (isDialogOpen()) {
             await selectMaxBalanceToken();
-            await sleep(CONFIG.waitAfterTokenSelect);
+            await sleep(SWAP_CONFIG.waitAfterTokenSelect);
           }
 
           await sleep(500);
           const chooseBtns2 = findChooseBtns();
           if (chooseBtns2.length > 0) {
             chooseBtns2[0].click();
-            UI.log("点击第二个 Choose (Receive)");
-            await sleep(CONFIG.waitAfterChoose);
+            UI.logSwap("点击第二个 Choose (Receive)");
+            await sleep(SWAP_CONFIG.waitAfterChoose);
 
             if (isDialogOpen()) {
               await selectReceiveToken();
-              await sleep(CONFIG.waitAfterTokenSelect);
+              await sleep(SWAP_CONFIG.waitAfterTokenSelect);
             }
           }
 
-          UI.log("✅ 代币选择完成");
+          UI.logSwap("✅ 代币选择完成");
           await sleep(1000);
           continue;
         }
 
-        // Step 1: MAX
         const btnMax = findMaxBtn();
 
         if (btnMax && btnMax.disabled) {
-          UI.log("⚠️ MAX 灰色，尝试切换方向...");
+          UI.logSwap("⚠️ MAX 灰色，尝试切换方向...");
           const btnSwitch = findSwitchBtn();
           if (btnSwitch) {
             btnSwitch.click();
-            await sleep(CONFIG.waitAfterFixSwitch);
+            await sleep(SWAP_CONFIG.waitAfterFixSwitch);
             continue;
           } else {
-            UI.log("❌ 找不到切换按钮");
+            UI.logSwap("❌ 找不到切换按钮");
           }
         }
 
         if (btnMax && !btnMax.disabled) {
           btnMax.click();
-          UI.log("✅ 点击 MAX");
+          UI.logSwap("✅ 点击 MAX");
         } else if (!btnMax) {
-          UI.log("❌ 没找到 MAX 按钮（可能页面未就绪/按钮文字不同）");
+          UI.logSwap("❌ 没找到 MAX 按钮（可能页面未就绪/按钮文字不同）");
           await sleep(2000);
           continue;
         }
 
-        await sleep(CONFIG.waitAfterMax);
+        await sleep(SWAP_CONFIG.waitAfterMax);
 
-        // Step 2: Confirm
         let confirmClicked = false;
-        for (let i = 0; i < CONFIG.maxRetryConfirm; i++) {
+        for (let i = 0; i < SWAP_CONFIG.maxRetryConfirm; i++) {
           const btnConfirm = findConfirmBtn();
           if (btnConfirm && !btnConfirm.disabled) {
             btnConfirm.click();
-            UI.log(`✅ 点击 Confirm (第 ${i + 1} 次)`);
+            UI.logSwap('✅ 点击 Confirm (第 ' + (i + 1) + ' 次)');
             confirmClicked = true;
             break;
           }
           await sleep(500);
         }
 
-        // Step 3: After confirm
         if (confirmClicked) {
-          await sleep(CONFIG.waitAfterConfirm);
+          await sleep(SWAP_CONFIG.waitAfterConfirm);
 
           const closeAfterConfirm = findCloseBtn();
           if (closeAfterConfirm) {
             closeAfterConfirm.click();
-            UI.log("✅ 关闭成功弹窗");
-            await sleep(CONFIG.waitAfterClose);
+            UI.logSwap("✅ 关闭成功弹窗");
+            await sleep(SWAP_CONFIG.waitAfterClose);
           }
 
           const btnSwitch = findSwitchBtn();
           if (btnSwitch) {
             btnSwitch.click();
-            UI.log("✅ 切换方向");
+            UI.logSwap("✅ 切换方向");
           }
 
-          const randomWait = getRandomTime(CONFIG.waitRandomMin, CONFIG.waitRandomMax);
-          UI.log(`🎲 随机休息 ${(randomWait / 1000).toFixed(1)} 秒...`);
+          const randomWait = getRandomTime(SWAP_CONFIG.waitRandomMin, SWAP_CONFIG.waitRandomMax);
+          UI.logSwap('🎲 随机休息 ' + (randomWait / 1000).toFixed(1) + ' 秒...');
           await sleep(randomWait);
         } else {
-          UI.log("⚠️ Confirm 未成功，短休后重试...");
+          UI.logSwap("⚠️ Confirm 未成功，短休后重试...");
           await sleep(2000);
         }
       } catch (e) {
-        UI.log("❌ 运行出错（已自动继续）");
+        UI.logSwap("❌ 运行出错（已自动继续）");
         console.error(e);
         await sleep(3000);
       }
     }
 
-    // loop ended
     window.botRunning = false;
-    UI.setRunning(false);
-    UI.log("🛑 Bot stopped.");
+    UI.setSwapRunning(false);
+    UI.logSwap("🛑 Bot stopped.");
   }
 
-  function stopLoop() {
-    isRunning = false;
+  function stopSwapLoop() {
+    isSwapRunning = false;
     window.botRunning = false;
-    UI.setRunning(false);
-    UI.log("🛑 stop() called");
+    localStorage.setItem(SWAP_CONFIG.KEY_SWAP_ENABLED, '0');
+    UI.setSwapRunning(false);
+    UI.logSwap("🛑 stop() called");
   }
 
-  // ========= 暴露停止方法（兼容你原来的 stopBot）=========
-  window.stopBot = () => stopLoop();
-  window.startBot = () => {
-    if (isRunning) return;
-    loopPromise = startLoop();
-  };
-
-  // ========= 绑定 UI / 热键 =========
-  function toggle() {
-    if (isRunning) stopLoop();
+  function toggleSwap() {
+    if (isSwapRunning) stopSwapLoop();
     else window.startBot();
   }
 
-  function bindHotkey() {
-    window.addEventListener('keydown', (e) => {
-      // Ctrl + Alt + S
-      if (e.ctrlKey && e.altKey && (e.key === 's' || e.key === 'S')) {
-        e.preventDefault();
-        toggle();
-      }
-    });
-  }
+  // ========= 暴露全域函數 =========
+  window.stopBot = () => stopSwapLoop();
+  window.startBot = () => {
+    if (isSwapRunning) return;
+    loopPromise = startSwapLoop();
+  };
 
   // ========= 初始化 =========
   function init() {
     mountUI();
-    bindHotkey();
+    if (refreshEnabled) scheduleRefresh();
+    else UI.renderRefresh();
 
-    UI.btnToggle.addEventListener('click', toggle);
-    UI.log('Loaded. Click Start or press Ctrl+Alt+S.');
+    // 如果刷新前 Swap Bot 是運行的，自動重啟
+    if (swapEnabled) {
+      UI.logSwap('🔄 檢測到頁面刷新前 Bot 正在運行，自動恢復中...');
+      setTimeout(() => {
+        window.startBot();
+      }, 2000);
+    } else {
+      UI.logSwap('Loaded. Click Start or press Ctrl+Alt+S.');
+    }
   }
 
-  // 等 body 可用
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
   } else {
@@ -474,9 +627,8 @@ titleWrap.appendChild(author);
   }
 })();
 
-
 /* ============================================================
- * Author: 51 | Hunter Association
+ * Author: 伍壹51 | Hunter Association
  * X (Twitter): https://x.com/0x515151
  *
  * NOTICE:
