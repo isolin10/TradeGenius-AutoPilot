@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TradeGenius Auto Swap - Enhanced Safety Edition
+// @name         TradeGenius Auto Swap - Simple Edition
 // @namespace    https://www.tradegenius.com
 // @version      1.0.0
-// @description  增強版自動 USDC/USDT 刷量腳本，具備完善的防呆機制與風險控制
+// @description  簡化版自動 USDC/USDT 刷量腳本，第一次 Preset 後持續 SWAP（無動態調整）
 // @author       B1N0RY
 // @match        https://www.tradegenius.com/trade
 // @grant        none
@@ -174,23 +174,9 @@
         enableSuccessVerification: true, // 啟用交易成功驗證
         enableAutoRecovery: true,        // 啟用自動恢復
 
-        // 動態調整設置
-        enableDynamicAdjustment: true,   // 啟用動態調整 Slippage 和 Priority
-        // Slippage 設置
-        slippageInitial: 0.10,          // 初始 Slippage (%)
-        slippageMin: 0.05,              // Slippage 下限 (%)
-        slippageMax: 0.30,              // Slippage 上限 (%)
-        slippageIncreaseOnFailure: 0.05, // 失敗時增加的 Slippage (%)
-        slippageDecreaseOnSuccess: 0.02, // 成功時減少的 Slippage (%)
-        // Priority 設置
-        priorityInitial: 0.002,         // 初始 Priority (gwei)
-        priorityMin: 0.002,             // Priority 下限 (gwei)
-        priorityMax: 0.01,              // Priority 上限 (gwei)
-        priorityIncreaseOnFailure: 0.001, // 失敗時增加的 Priority (gwei)
-        priorityDecreaseOnSuccess: 0.0005, // 成功時減少的 Priority (gwei)
-        // 觸發閾值
-        consecutiveFailureThreshold: 2,  // 連續失敗多少次後觸發調整
-        consecutiveSuccessThreshold: 8,  // 連續成功多少次後觸發調整
+        // Preset 設置（固定值）
+        slippageValue: 0.1,              // Preset 時的 Slippage (%)
+        priorityValue: 0.002,           // Preset 時的 Priority (gwei)
 
         // 調試
         debug: true
@@ -209,19 +195,32 @@
     let lastCycleFromToken = null;  // 記錄上一次交易循環開始時的發送幣種
     let lastCycleConfirmed = false; // 記錄上一次循環是否執行了 Confirm
 
-    // 動態調整相關變量
-    let consecutiveSuccesses = 0;   // 連續成功次數
-    let currentSlippage = CONFIG.slippageInitial;  // 當前 Slippage 值
-    let currentPriority = CONFIG.priorityInitial;  // 當前 Priority 值
-    let isAdjusting = false;        // 調整中標記，避免並發調整
-    let pendingAdjustment = null;   // 待處理的調整請求
-
     // 防止螢幕關閉時暫停的相關變量
     let wakeLock = null;  // Wake Lock API 對象
     let heartbeatInterval = null;  // 心跳定時器
     let lastHeartbeatTime = Date.now();  // 上次心跳時間
     let throttleDetectionEnabled = true;  // 是否啟用時間節流檢測
     let visibilityListenerSetup = false;  // 是否已設置可見性監聽器
+    
+    // ==================== 狀態機系統 ====================
+    // 定義交易流程的狀態
+    const SwapState = {
+        IDLE: 'idle',                           // 閒置狀態
+        CHECKING_BALANCE: 'checking_balance',   // 檢查餘額
+        SELECTING_FIRST_TOKEN: 'selecting_first_token',  // 選擇第一個代幣
+        SELECTING_SECOND_TOKEN: 'selecting_second_token', // 選擇第二個代幣
+        CLICKING_MAX: 'clicking_max',           // 點擊 MAX
+        WAITING_FOR_QUOTE: 'waiting_for_quote', // 等待報價
+        CLICKING_CONFIRM: 'clicking_confirm',   // 點擊 Confirm
+        WAITING_FOR_RESULT: 'waiting_for_result', // 等待交易結果
+        CLOSING_POPUP: 'closing_popup',         // 關閉彈窗
+        PAUSED_HIDDEN: 'paused_hidden'          // 因頁面隱藏而暫停
+    };
+    
+    let currentSwapState = SwapState.IDLE;  // 當前狀態
+    let stateData = {};  // 狀態相關數據（用於恢復）
+    let isPageVisible = !document.hidden;  // 頁面是否可見
+    let resumeFromState = false;  // 是否需要從狀態恢復
 
     let stats = {
         totalSwaps: 0,
@@ -234,14 +233,76 @@
 
     // ==================== 工具函數 ====================
     // 改進的 sleep 函數，能夠檢測並補償時間節流（當螢幕關閉時）
-    const sleep = async (ms) => {
+    // 在頁面 hidden 時會等待頁面重新可見，避免在不可見時執行操作
+    const sleep = async (ms, allowHiddenExecution = false) => {
         const startTime = Date.now();
         const checkInterval = Math.min(100, ms); // 每 100ms 檢查一次，或更短
         let lastCheckTime = startTime;
+        let hiddenStartTime = null;  // 記錄進入 hidden 狀態的時間
         
         while (Date.now() - startTime < ms) {
             if (!isRunning) {
                 return; // 如果已停止，立即返回
+            }
+            
+            // 檢查頁面可見性
+            const isCurrentlyVisible = !document.hidden;
+            
+            // 如果頁面變為 hidden 且不允許在 hidden 時執行，等待頁面重新可見
+            if (!allowHiddenExecution && !isCurrentlyVisible) {
+                if (hiddenStartTime === null) {
+                    hiddenStartTime = Date.now();
+                    // 如果正在執行關鍵操作，進入暫停狀態
+                    if (currentSwapState !== SwapState.IDLE && 
+                        currentSwapState !== SwapState.PAUSED_HIDDEN) {
+                        const previousState = currentSwapState;
+                        currentSwapState = SwapState.PAUSED_HIDDEN;
+                        stateData.pausedFromState = previousState;
+                        stateData.pausedAt = hiddenStartTime;
+                        log(`⏸️ 頁面隱藏，暫停操作（從狀態 ${previousState} 暫停）`, 'warning');
+                    }
+                }
+                
+                // 等待頁面重新可見（最多等待剩餘時間）
+                const remaining = ms - (Date.now() - startTime);
+                if (remaining > 0) {
+                    // 每 500ms 檢查一次頁面是否重新可見
+                    await new Promise(resolve => {
+                        const checkVisible = setInterval(() => {
+                            if (!document.hidden || !isRunning) {
+                                clearInterval(checkVisible);
+                                resolve();
+                            }
+                        }, 500);
+                        // 設置超時，避免無限等待
+                        setTimeout(() => {
+                            clearInterval(checkVisible);
+                            resolve();
+                        }, Math.min(remaining, 10000)); // 最多等待 10 秒或剩餘時間
+                    });
+                    
+                    // 如果頁面重新可見，恢復狀態
+                    if (!document.hidden && currentSwapState === SwapState.PAUSED_HIDDEN) {
+                        const hiddenDuration = Date.now() - hiddenStartTime;
+                        log(`▶️ 頁面重新可見，恢復操作（已暫停 ${Math.floor(hiddenDuration / 1000)} 秒）`, 'success');
+                        if (stateData.pausedFromState) {
+                            currentSwapState = stateData.pausedFromState;
+                            resumeFromState = true;
+                            log(`🔄 準備恢復到狀態: ${currentSwapState}`, 'info');
+                        }
+                        hiddenStartTime = null;
+                    }
+                }
+                
+                // 如果頁面仍然 hidden，繼續等待
+                if (document.hidden) {
+                    continue;
+                }
+            } else {
+                // 頁面可見，重置 hidden 計時器
+                if (hiddenStartTime !== null) {
+                    hiddenStartTime = null;
+                }
             }
             
             const now = Date.now();
@@ -249,7 +310,7 @@
             const remaining = ms - elapsed;
             
             // 檢測時間節流：如果實際經過的時間遠大於預期，說明被節流了
-            if (throttleDetectionEnabled) {
+            if (throttleDetectionEnabled && isCurrentlyVisible) {
                 const actualElapsed = now - lastCheckTime;
                 // 如果實際經過的時間超過預期的 2 倍，說明被節流了
                 if (actualElapsed > checkInterval * 2 && lastCheckTime !== startTime) {
@@ -268,7 +329,6 @@
             }
             
             // 使用實際時間計算，而不是依賴可能被節流的 setTimeout
-            // 即使頁面不可見，也使用 setTimeout，因為我們已經用實際時間來補償
             await new Promise(resolve => {
                 setTimeout(resolve, Math.min(checkInterval, remaining));
             });
@@ -394,13 +454,40 @@
         }
         
         document.addEventListener('visibilitychange', () => {
+            const wasVisible = isPageVisible;
+            isPageVisible = !document.hidden;
+            
             if (document.hidden) {
                 log('⚠️ 頁面已隱藏（切換到其他標籤頁或最小化）', 'warning');
-                log('腳本將繼續運行，但可能受到瀏覽器節流影響', 'info');
+                
+                // 如果正在執行交易流程，保存當前狀態並進入暫停模式
+                if (isRunning && currentSwapState !== SwapState.IDLE && 
+                    currentSwapState !== SwapState.PAUSED_HIDDEN) {
+                    log(`💾 保存當前狀態: ${currentSwapState}，進入安全暫停模式`, 'info');
+                    // 保存當前狀態，以便恢復
+                    const previousState = currentSwapState;
+                    currentSwapState = SwapState.PAUSED_HIDDEN;
+                    stateData.pausedFromState = previousState;
+                    stateData.pausedAt = Date.now();
+                    resumeFromState = true;
+                } else {
+                    log('腳本將繼續運行，但可能受到瀏覽器節流影響', 'info');
+                }
             } else {
                 log('✅ 頁面已顯示', 'success');
                 // 頁面重新可見時，更新心跳時間
                 lastHeartbeatTime = Date.now();
+                
+                // 如果之前處於暫停狀態，準備恢復
+                if (isRunning && currentSwapState === SwapState.PAUSED_HIDDEN) {
+                    log('🔄 頁面重新可見，準備從暫停狀態恢復...', 'info');
+                    const pausedDuration = Date.now() - (stateData.pausedAt || Date.now());
+                    log(`⏱️ 暫停時長: ${Math.floor(pausedDuration / 1000)} 秒`, 'info');
+                    
+                    // 重置暫停標記，準備恢復
+                    resumeFromState = true;
+                    // 狀態將在下一輪循環中恢復
+                }
             }
         });
         
@@ -556,6 +643,9 @@
     }
 
     async function checkBalanceSufficient() {
+        // 直接跳過餘額檢查
+        return true;
+        
         if (!CONFIG.enableBalanceMonitoring) return true;
 
         // 在讀取餘額前，確保沒有其他視窗遮擋 SWAP 視窗
@@ -566,9 +656,34 @@
             await sleep(500);
         }
 
+        // 帶重試機制的餘額讀取（最多重試 2 次）
+        let balances = { USDT: 0, USDC: 0 };
+        let balanceReadSuccess = false;
+        
+        for (let retry = 0; retry < 3; retry++) {
+            balances = await getTokenBalances();
+            
+            // 檢查餘額是否有效（不全為 0）
+            if (balances.USDT > 0 || balances.USDC > 0) {
+                balanceReadSuccess = true;
+                break;
+            }
+            
+            // 如果餘額全為 0，可能是讀取時機不對，重試前先等待
+            if (retry < 2) {
+                log(`⚠️ 餘額讀取異常（全為 0），${1.5} 秒後重試... (${retry + 1}/3)`, 'warning');
+                await sleep(1500);
+            }
+        }
+        
+        // 如果重試後仍然全為 0，發出警告但繼續執行（可能是頁面還沒完全載入）
+        if (!balanceReadSuccess) {
+            log(`⚠️ 餘額讀取失敗（多次重試後仍為 0），可能是頁面尚未完全載入，將繼續執行`, 'warning');
+            // 不直接返回 false，而是繼續檢查，因為可能是讀取時機問題
+        }
+
         // 如果已經選擇了發送代幣，優先檢查該代幣的餘額
         if (currentFromToken) {
-            const balances = await getTokenBalances();
             const selectedBalance = balances[currentFromToken] || 0;
             
             if (selectedBalance < CONFIG.minBalanceThreshold) {
@@ -582,7 +697,6 @@
         }
 
         // 如果還沒有選擇代幣，檢查所有代幣的最大餘額
-        const balances = await getTokenBalances();
         const maxBalance = Math.max(balances.USDT, balances.USDC);
 
         if (maxBalance < CONFIG.minBalanceThreshold) {
@@ -2374,45 +2488,31 @@
         const step4 = await clickBuyOrSellButton('Buy');
         if (step4) successCount++;
         
-        // 步驟 5: 設定 Buy 方的 slippage % 至初始值（為所有 M.Cap 選項設定）
+        // 步驟 5: 設定 Buy 方的 slippage % 至固定值（為所有 M.Cap 選項設定）
         if (!isRunning) return false;
-        const slippageInitialValue = CONFIG.enableDynamicAdjustment ? CONFIG.slippageInitial : 0.1;
-        const slippageInitialStr = slippageInitialValue.toFixed(2);
-        log(`步驟 5/15: 設定 Buy 方的所有 M.Cap 選項的 Slippage 至 ${slippageInitialStr}%`, 'info');
-        const step5 = await setSlippageForAllMCaps(slippageInitialValue, 'Buy');
+        const slippageValueStr = CONFIG.slippageValue.toFixed(2);
+        log(`步驟 5/15: 設定 Buy 方的所有 M.Cap 選項的 Slippage 至 ${slippageValueStr}%`, 'info');
+        const step5 = await setSlippageForAllMCaps(CONFIG.slippageValue, 'Buy');
         if (step5) {
             successCount++;
-            // 更新當前值
-            if (CONFIG.enableDynamicAdjustment) {
-                currentSlippage = slippageInitialValue;
-            }
         } else {
             log('⚠️ Buy 方的 M.Cap Slippage 設定未完全成功，但將繼續', 'warning');
             // 即使部分失敗也計為成功，因為至少設定了一些
             successCount++;
-            // 更新當前值
-            if (CONFIG.enableDynamicAdjustment) {
-                currentSlippage = slippageInitialValue;
-            }
         }
         
-        // 步驟 6: 設定 Buy 方的 Priority (Gwei) 至初始值
+        // 步驟 6: 設定 Buy 方的 Priority (Gwei) 至固定值
         if (!isRunning) return false;
-        const priorityInitialValue = CONFIG.enableDynamicAdjustment ? CONFIG.priorityInitial : 0.002;
-        const priorityInitialStr = priorityInitialValue.toFixed(4);
-        log(`步驟 6/15: 設定 Buy 方的 Priority (Gwei) 至 ${priorityInitialStr}`, 'info');
+        const priorityValueStr = CONFIG.priorityValue.toFixed(4);
+        log(`步驟 6/15: 設定 Buy 方的 Priority (Gwei) 至 ${priorityValueStr}`, 'info');
         const step6 = await findAndSetInput([
             { type: 'text', text: 'Priority (Gwei)' }
-        ], priorityInitialStr, 'Buy 方的 Priority (Gwei)');
+        ], priorityValueStr, 'Buy 方的 Priority (Gwei)');
         if (step6) {
             successCount++;
-            // 更新當前值
-            if (CONFIG.enableDynamicAdjustment) {
-                currentPriority = priorityInitialValue;
-            }
             // 驗證 Priority (Gwei) 值是否已保存
             await sleep(1000);
-            const priorityVerified = await verifyInputValue('Priority (Gwei)', priorityInitialStr);
+            const priorityVerified = await verifyInputValue('Priority (Gwei)', priorityValueStr);
             if (!priorityVerified) {
                 log('⚠️ Buy 方的 Priority (Gwei) 值驗證失敗，但將繼續', 'warning');
             }
@@ -2424,10 +2524,10 @@
         const step7 = await clickBuyOrSellButton('Sell');
         if (step7) successCount++;
         
-        // 步驟 8: 設定 Sell 方的 slippage % 至初始值（為所有 M.Cap 選項設定）
+        // 步驟 8: 設定 Sell 方的 slippage % 至固定值（為所有 M.Cap 選項設定）
         if (!isRunning) return false;
-        log(`步驟 8/15: 設定 Sell 方的所有 M.Cap 選項的 Slippage 至 ${slippageInitialStr}%`, 'info');
-        const step8 = await setSlippageForAllMCaps(slippageInitialValue, 'Sell');
+        log(`步驟 8/15: 設定 Sell 方的所有 M.Cap 選項的 Slippage 至 ${slippageValueStr}%`, 'info');
+        const step8 = await setSlippageForAllMCaps(CONFIG.slippageValue, 'Sell');
         if (step8) {
             successCount++;
         } else {
@@ -2436,17 +2536,17 @@
             successCount++;
         }
         
-        // 步驟 9: 設定 Sell 方的 Priority (Gwei) 至初始值
+        // 步驟 9: 設定 Sell 方的 Priority (Gwei) 至固定值
         if (!isRunning) return false;
-        log(`步驟 9/15: 設定 Sell 方的 Priority (Gwei) 至 ${priorityInitialStr}`, 'info');
+        log(`步驟 9/15: 設定 Sell 方的 Priority (Gwei) 至 ${priorityValueStr}`, 'info');
         const step9 = await findAndSetInput([
             { type: 'text', text: 'Priority (Gwei)' }
-        ], priorityInitialStr, 'Sell 方的 Priority (Gwei)');
+        ], priorityValueStr, 'Sell 方的 Priority (Gwei)');
         if (step9) {
             successCount++;
             // 驗證 Priority (Gwei) 值是否已保存
             await sleep(1000);
-            const priorityVerified = await verifyInputValue('Priority (Gwei)', priorityInitialStr);
+            const priorityVerified = await verifyInputValue('Priority (Gwei)', priorityValueStr);
             if (!priorityVerified) {
                 log('⚠️ Sell 方的 Priority (Gwei) 值驗證失敗，但將繼續', 'warning');
             }
@@ -3378,669 +3478,6 @@
         }
     }
 
-    // 動態調整 Slippage 和 Priority（改進版）
-    async function adjustSlippageAndPriority(isSuccess) {
-        if (!CONFIG.enableDynamicAdjustment) {
-            return;
-        }
-
-        if (isSuccess) {
-            consecutiveSuccesses++;
-            consecutiveFailures = 0; // 重置失敗計數
-            UI.updateStats(); // 更新 UI 顯示
-            
-            // 連續成功達到閾值時，小幅下調
-            if (consecutiveSuccesses >= CONFIG.consecutiveSuccessThreshold) {
-                const newSlippage = Math.max(
-                    CONFIG.slippageMin,
-                    currentSlippage - CONFIG.slippageDecreaseOnSuccess
-                );
-                const newPriority = Math.max(
-                    CONFIG.priorityMin,
-                    currentPriority - CONFIG.priorityDecreaseOnSuccess
-                );
-                
-                // 只有當值真正改變時才進行調整
-                if (newSlippage !== currentSlippage || newPriority !== currentPriority) {
-                    log(`📉 連續成功 ${consecutiveSuccesses} 次，準備調整參數：Slippage ${currentSlippage.toFixed(2)}% → ${newSlippage.toFixed(2)}%, Priority ${currentPriority.toFixed(4)} gwei → ${newPriority.toFixed(4)} gwei`, 'info');
-                    
-                    // 使用安全調整機制
-                    const adjusted = await safeAdjustParameters(newSlippage, newPriority);
-                    if (adjusted) {
-                        currentSlippage = newSlippage;
-                        currentPriority = newPriority;
-                        log(`✓ 參數調整成功`, 'success');
-                        UI.updateStats(); // 更新 UI 顯示
-                    } else {
-                        log(`⚠️ 參數調整失敗，將在下次循環重試`, 'warning');
-                    }
-                    // 無論調整是否成功，都重置計數器（避免重複觸發）
-                    consecutiveSuccesses = 0;
-                    UI.updateStats(); // 更新連續成功次數顯示
-                } else {
-                    // 已達到下限，重置計數器
-                    log(`ℹ️ 連續成功 ${consecutiveSuccesses} 次，但參數已達下限，重置計數器`, 'info');
-                    consecutiveSuccesses = 0;
-                    UI.updateStats(); // 更新連續成功次數顯示
-                }
-            }
-        } else {
-            consecutiveSuccesses = 0; // 重置成功計數
-            consecutiveFailures++;
-            UI.updateStats(); // 更新 UI 顯示
-            
-            // 連續失敗達到閾值時，小幅上調
-            if (consecutiveFailures >= CONFIG.consecutiveFailureThreshold) {
-                const newSlippage = Math.min(
-                    CONFIG.slippageMax,
-                    currentSlippage + CONFIG.slippageIncreaseOnFailure
-                );
-                const newPriority = Math.min(
-                    CONFIG.priorityMax,
-                    currentPriority + CONFIG.priorityIncreaseOnFailure
-                );
-                
-                // 只有當值真正改變時才進行調整
-                if (newSlippage !== currentSlippage || newPriority !== currentPriority) {
-                    log(`📈 連續失敗 ${consecutiveFailures} 次，準備調整參數：Slippage ${currentSlippage.toFixed(2)}% → ${newSlippage.toFixed(2)}%, Priority ${currentPriority.toFixed(4)} gwei → ${newPriority.toFixed(4)} gwei`, 'warning');
-                    
-                    // 使用安全調整機制
-                    const adjusted = await safeAdjustParameters(newSlippage, newPriority);
-                    if (adjusted) {
-                        currentSlippage = newSlippage;
-                        currentPriority = newPriority;
-                        log(`✓ 參數調整成功`, 'success');
-                        UI.updateStats(); // 更新 UI 顯示
-                    } else {
-                        log(`⚠️ 參數調整失敗，將在下次循環重試`, 'warning');
-                    }
-                    // 無論調整是否成功，都重置計數器（避免重複觸發）
-                    consecutiveFailures = 0;
-                    UI.updateStats(); // 更新連續失敗次數顯示
-                } else {
-                    // 已達到上限，重置計數器
-                    log(`ℹ️ 連續失敗 ${consecutiveFailures} 次，但參數已達上限，重置計數器`, 'info');
-                    consecutiveFailures = 0;
-                    UI.updateStats(); // 更新連續失敗次數顯示
-                }
-            }
-        }
-    }
-
-    // 安全調整參數（帶並發控制和重試）
-    async function safeAdjustParameters(slippage, priority) {
-        // 如果正在調整中，記錄待處理請求
-        if (isAdjusting) {
-            log('⚠️ 參數調整進行中，待完成後處理', 'warning');
-            pendingAdjustment = { slippage, priority };
-            return false;
-        }
-
-        isAdjusting = true;
-        
-        try {
-            // 最多重試 3 次
-            for (let attempt = 1; attempt <= 3; attempt++) {
-                if (!isRunning) {
-                    log('⚠️ 程序已停止，取消參數調整', 'warning');
-                    return false;
-                }
-
-                if (attempt > 1) {
-                    log(`重試參數調整 (${attempt}/3)...`, 'info');
-                    await sleep(2000);
-                }
-
-                const success = await applySlippageAndPriority(slippage, priority);
-                if (success) {
-                    return true;
-                }
-            }
-            
-            log('❌ 參數調整失敗（已重試 3 次）', 'error');
-            return false;
-        } finally {
-            isAdjusting = false;
-        }
-    }
-
-    // 選擇 Optimism 鏈（用於動態調整）
-    async function selectOptimismChainInSettings() {
-        log('檢查並選擇 Optimism 鏈...', 'info');
-        
-        // 先檢查當前是否已選擇 Optimism 鏈
-        const networkButton = document.querySelector('[data-sentry-component="NetworkButton"]');
-        if (networkButton) {
-            const networkText = networkButton.innerText?.trim() || networkButton.textContent?.trim() || '';
-            if (networkText.includes('Optimism') || networkText.includes('OP') || networkText.includes('OP Mainnet')) {
-                log('✓ 當前已選擇 Optimism 鏈', 'success');
-                return true;
-            }
-        }
-        
-        // 如果未選擇 Optimism 鏈，則選擇它
-        log('當前未選擇 Optimism 鏈，開始選擇...', 'info');
-        
-        // 步驟 1: 點擊 Network 選擇按鈕
-        const networkBtnClicked = await findAndClickElement([
-            '[data-sentry-component="NetworkButton"]',
-            { type: 'text', text: 'Solana' },
-            'div[class*="border-genius-blue"][class*="cursor-pointer"]'
-        ], 'Network 選擇按鈕', 1500);
-        
-        if (!networkBtnClicked) {
-            log('❌ 無法點擊 Network 選擇按鈕', 'error');
-            return false;
-        }
-        
-        await sleep(1500);
-        
-        // 步驟 2: 查找並點擊 Optimism 鏈按鈕
-        let optimismButton = null;
-        
-        // 確保 Network 選擇對話框已打開
-        const networkDialog = document.querySelector('[role="dialog"][data-state="open"]');
-        const hasNetworkDialog = networkDialog && 
-            (networkDialog.querySelector('[data-sentry-component="NetworkButton"]') || 
-             networkDialog.innerText?.includes('Network') ||
-             networkDialog.innerText?.includes('Optimism') ||
-             networkDialog.innerText?.includes('Solana'));
-        
-        if (!hasNetworkDialog) {
-            log('⚠️ Network 選擇對話框未打開，重試...', 'warning');
-            const networkBtn = document.querySelector('[data-sentry-component="NetworkButton"]');
-            if (networkBtn) {
-                networkBtn.click();
-                await sleep(1500);
-            }
-        }
-        
-        // 方法1: 通過 TokenImage 查找
-        const tokenImages = document.querySelectorAll('[data-sentry-component="TokenImage"]');
-        for (const tokenImage of tokenImages) {
-            let parent = tokenImage.parentElement;
-            let attempts = 0;
-            while (parent && attempts < 12) {
-                const classes = typeof parent.className === 'string' ? parent.className : (parent.className?.baseVal || parent.className?.toString() || '');
-                
-                if (classes.includes('cursor-pointer') && 
-                    (classes.includes('hover:bg-genius-blue') || classes.includes('rounded-sm'))) {
-                    
-                    const text = parent.innerText?.trim() || parent.textContent?.trim() || '';
-                    const hasOptimismText = text === 'Optimism' || 
-                                          (text.includes('Optimism') && !text.includes('Solana') && !text.includes('Ethereum') && text.length < 50);
-                    
-                    if (hasOptimismText) {
-                        const inDialog = parent.closest('[role="dialog"]');
-                        if (inDialog || hasNetworkDialog) {
-                            const rect = parent.getBoundingClientRect();
-                            const style = window.getComputedStyle(parent);
-                            
-                            if (rect.width > 0 && rect.height > 0 && 
-                                style.display !== 'none' && 
-                                style.visibility !== 'hidden' &&
-                                parent.offsetParent !== null) {
-                                optimismButton = parent;
-                                log('✓ 找到 Optimism 鏈按鈕', 'info');
-                                break;
-                            }
-                        }
-                    }
-                }
-                parent = parent.parentElement;
-                attempts++;
-            }
-            if (optimismButton) break;
-        }
-        
-        // 方法2: 通過 span 文字查找
-        if (!optimismButton) {
-            const allSpans = document.querySelectorAll('span.text-genius-cream, span[class*="text-genius-cream"]');
-            for (const span of allSpans) {
-                const text = span.innerText?.trim() || span.textContent?.trim() || '';
-                if (text === 'Optimism' || (text.toLowerCase() === 'optimism')) {
-                    let parent = span.parentElement;
-                    let attempts = 0;
-                    while (parent && attempts < 12) {
-                        const classes = typeof parent.className === 'string' ? parent.className : (parent.className?.baseVal || parent.className?.toString() || '');
-                        
-                        if (classes.includes('cursor-pointer') && 
-                            (classes.includes('hover:bg-genius-blue') || classes.includes('rounded-sm'))) {
-                            
-                            const hasTokenImage = parent.querySelector('[data-sentry-component="TokenImage"]');
-                            if (hasTokenImage) {
-                                const inDialog = parent.closest('[role="dialog"]');
-                                if (inDialog || hasNetworkDialog) {
-                                    const rect = parent.getBoundingClientRect();
-                                    const style = window.getComputedStyle(parent);
-                                    
-                                    if (rect.width > 0 && rect.height > 0 && 
-                                        style.display !== 'none' && 
-                                        style.visibility !== 'hidden' &&
-                                        parent.offsetParent !== null) {
-                                        optimismButton = parent;
-                                        log('✓ 通過 span 文字找到 Optimism 鏈按鈕', 'info');
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        parent = parent.parentElement;
-                        attempts++;
-                    }
-                    if (optimismButton) break;
-                }
-            }
-        }
-        
-        // 方法3: 通過 div 查找
-        if (!optimismButton) {
-            const allDivs = document.querySelectorAll('div.cursor-pointer');
-            for (const div of allDivs) {
-                const text = div.innerText?.trim() || div.textContent?.trim() || '';
-                if (text === 'Optimism' || (text.includes('Optimism') && !text.includes('Solana') && !text.includes('Ethereum') && text.length < 50)) {
-                    const rect = div.getBoundingClientRect();
-                    const style = window.getComputedStyle(div);
-                    
-                    if (rect.width > 0 && rect.height > 0 && 
-                        style.display !== 'none' && 
-                        style.visibility !== 'hidden' &&
-                        div.offsetParent !== null) {
-                        const hasTokenImage = div.querySelector('[data-sentry-component="TokenImage"]');
-                        if (hasTokenImage) {
-                            const inDialog = div.closest('[role="dialog"]');
-                            if (inDialog || hasNetworkDialog) {
-                                optimismButton = div;
-                                log('✓ 通過 div 找到 Optimism 鏈按鈕', 'info');
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        if (!optimismButton) {
-            log('❌ 未找到 Optimism 鏈按鈕', 'error');
-            return false;
-        }
-        
-        // 點擊 Optimism 鏈按鈕
-        optimismButton.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        await sleep(400);
-        optimismButton.click();
-        log('✓ 點擊 Optimism 鏈按鈕', 'success');
-        
-        // 等待 UI 更新並驗證
-        await sleep(2500);
-        
-        // 驗證是否成功選擇
-        for (let verifyAttempt = 0; verifyAttempt < 5; verifyAttempt++) {
-            const checkNetworkBtn = document.querySelector('[data-sentry-component="NetworkButton"]');
-            if (checkNetworkBtn) {
-                const checkText = checkNetworkBtn.innerText?.trim() || checkNetworkBtn.textContent?.trim() || '';
-                if (checkText.includes('Optimism') || checkText.includes('OP') || checkText.includes('OP Mainnet')) {
-                    log('✓ Optimism 鏈已成功選中', 'success');
-                    return true;
-                }
-            }
-            
-            // 檢查對話框是否已關閉（表示已選擇）
-            const currentNetworkDialog = document.querySelector('[role="dialog"][data-state="open"]');
-            const stillHasNetworkDialog = currentNetworkDialog && 
-                (currentNetworkDialog.querySelector('[data-sentry-component="NetworkButton"]') || 
-                 currentNetworkDialog.innerText?.includes('Network') ||
-                 currentNetworkDialog.innerText?.includes('Optimism') ||
-                 currentNetworkDialog.innerText?.includes('Solana'));
-            
-            if (!stillHasNetworkDialog && verifyAttempt >= 2) {
-                log('✓ Network 選擇對話框已關閉，假設 Optimism 鏈已選中', 'success');
-                return true;
-            }
-            
-            await sleep(500);
-        }
-        
-        log('⚠️ Optimism 鏈選擇驗證失敗，但繼續執行', 'warning');
-        return true; // 即使驗證失敗也繼續，可能是驗證邏輯的問題
-    }
-
-    // 應用 Slippage 和 Priority 設定（改進版）
-    async function applySlippageAndPriority(slippage, priority) {
-        let settingsWasOpen = false;
-        
-        try {
-            const slippageValue = slippage.toFixed(2);
-            const priorityValue = priority.toFixed(4);
-            
-            log(`開始調整參數：Slippage → ${slippageValue}%, Priority → ${priorityValue} gwei`, 'info');
-            
-            // 檢查 Settings 面板是否已打開
-            const settingsPanelCheck = document.querySelector('[class*="Settings"]') || 
-                                     document.querySelector('[role="dialog"]');
-            if (settingsPanelCheck) {
-                const panelText = settingsPanelCheck.innerText || '';
-                if (panelText.includes('Slippage') || panelText.includes('Priority')) {
-                    settingsWasOpen = true;
-                    log('Settings 面板已打開', 'info');
-                }
-            }
-            
-            // 如果 Settings 面板未打開，則打開它
-            if (!settingsWasOpen) {
-                log('打開 Settings 面板...', 'info');
-                const settingsBtn = await findAndClickElement([
-                    { type: 'svg', class: 'lucide-settings2' },
-                    { type: 'svg', class: 'lucide-settings-2' },
-                    'svg[class*="lucide-settings"]'
-                ], 'Settings 按鈕', 2000);
-                
-                if (!settingsBtn) {
-                    log('❌ 無法打開 Settings 面板', 'error');
-                    return false;
-                }
-                
-                await sleep(2000); // 等待面板完全展開
-                
-                // 驗證面板是否真的打開了
-                await sleep(500);
-                const panelOpened = document.querySelector('[class*="Settings"]') || 
-                                  (document.querySelector('[role="dialog"]') && 
-                                   (document.body.innerText.includes('Slippage') || document.body.innerText.includes('Priority')));
-                
-                if (!panelOpened) {
-                    log('❌ Settings 面板未成功打開', 'error');
-                    return false;
-                }
-                
-                log('✓ Settings 面板已打開', 'success');
-            }
-            
-            // 關鍵改進：在調整參數前，先確保選擇了 Optimism 鏈
-            log('確保已選擇 Optimism 鏈...', 'info');
-            const chainSelected = await selectOptimismChainInSettings();
-            if (!chainSelected) {
-                log('⚠️ Optimism 鏈選擇失敗，但繼續嘗試調整參數', 'warning');
-                // 即使鏈選擇失敗也繼續，因為可能已經在正確的鏈上
-            }
-            
-            // 等待鏈選擇完成後的 UI 更新
-            await sleep(1500);
-
-            // 設定 Buy 方的參數
-            log('點擊 Buy 按鈕...', 'info');
-            const buyClicked = await clickBuyOrSellButton('Buy');
-            if (!buyClicked) {
-                log('⚠️ Buy 按鈕點擊失敗，但繼續嘗試設定參數', 'warning');
-            }
-            await sleep(1000);
-
-            // 設定 Buy 方的 Slippage
-            log(`設定 Buy 方的 Slippage 至 ${slippageValue}%...`, 'info');
-            const buySlippageSuccess = await findAndSetInput([
-                { type: 'text', text: 'Slippage' },
-                { type: 'data-attr', attr: 'data-sentry-component', value: 'Slippage' }
-            ], slippageValue, 'Buy 方的 Slippage');
-            
-            if (!buySlippageSuccess) {
-                log('❌ Buy 方的 Slippage 設定失敗', 'error');
-                return false;
-            }
-            
-            // 驗證 Buy 方的 Slippage（重試最多 3 次）
-            let buySlippageVerified = false;
-            for (let i = 0; i < 3; i++) {
-                await sleep(800);
-                buySlippageVerified = await verifyInputValue('Slippage', slippageValue);
-                if (buySlippageVerified) {
-                    log(`✓ Buy 方的 Slippage 驗證通過: ${slippageValue}%`, 'success');
-                    break;
-                }
-                if (i < 2) {
-                    log(`⚠️ Buy 方的 Slippage 驗證失敗，重試 ${i + 1}/3...`, 'warning');
-                    await findAndSetInput([
-                        { type: 'text', text: 'Slippage' },
-                        { type: 'data-attr', attr: 'data-sentry-component', value: 'Slippage' }
-                    ], slippageValue, 'Buy 方的 Slippage');
-                }
-            }
-            
-            if (!buySlippageVerified) {
-                log('❌ Buy 方的 Slippage 驗證失敗（已重試 3 次）', 'error');
-                return false;
-            }
-
-            // 設定 Buy 方的 Priority
-            log(`設定 Buy 方的 Priority (Gwei) 至 ${priorityValue}...`, 'info');
-            const buyPrioritySuccess = await findAndSetInput([
-                { type: 'text', text: 'Priority (Gwei)' }
-            ], priorityValue, 'Buy 方的 Priority (Gwei)');
-            
-            if (!buyPrioritySuccess) {
-                log('❌ Buy 方的 Priority 設定失敗', 'error');
-                return false;
-            }
-            
-            // 驗證 Buy 方的 Priority（重試最多 3 次）
-            let buyPriorityVerified = false;
-            for (let i = 0; i < 3; i++) {
-                await sleep(800);
-                buyPriorityVerified = await verifyInputValue('Priority (Gwei)', priorityValue);
-                if (buyPriorityVerified) {
-                    log(`✓ Buy 方的 Priority 驗證通過: ${priorityValue} gwei`, 'success');
-                    break;
-                }
-                if (i < 2) {
-                    log(`⚠️ Buy 方的 Priority 驗證失敗，重試 ${i + 1}/3...`, 'warning');
-                    await findAndSetInput([
-                        { type: 'text', text: 'Priority (Gwei)' }
-                    ], priorityValue, 'Buy 方的 Priority (Gwei)');
-                }
-            }
-            
-            if (!buyPriorityVerified) {
-                log('❌ Buy 方的 Priority 驗證失敗（已重試 3 次）', 'error');
-                return false;
-            }
-
-            // 設定 Sell 方的參數
-            log('點擊 Sell 按鈕...', 'info');
-            const sellClicked = await clickBuyOrSellButton('Sell');
-            if (!sellClicked) {
-                log('⚠️ Sell 按鈕點擊失敗，但繼續嘗試設定參數', 'warning');
-            }
-            await sleep(1000);
-
-            // 設定 Sell 方的 Slippage
-            log(`設定 Sell 方的 Slippage 至 ${slippageValue}%...`, 'info');
-            const sellSlippageSuccess = await findAndSetInput([
-                { type: 'text', text: 'Slippage' },
-                { type: 'data-attr', attr: 'data-sentry-component', value: 'Slippage' }
-            ], slippageValue, 'Sell 方的 Slippage');
-            
-            if (!sellSlippageSuccess) {
-                log('❌ Sell 方的 Slippage 設定失敗', 'error');
-                return false;
-            }
-            
-            // 驗證 Sell 方的 Slippage（重試最多 3 次）
-            let sellSlippageVerified = false;
-            for (let i = 0; i < 3; i++) {
-                await sleep(800);
-                sellSlippageVerified = await verifyInputValue('Slippage', slippageValue);
-                if (sellSlippageVerified) {
-                    log(`✓ Sell 方的 Slippage 驗證通過: ${slippageValue}%`, 'success');
-                    break;
-                }
-                if (i < 2) {
-                    log(`⚠️ Sell 方的 Slippage 驗證失敗，重試 ${i + 1}/3...`, 'warning');
-                    await findAndSetInput([
-                        { type: 'text', text: 'Slippage' },
-                        { type: 'data-attr', attr: 'data-sentry-component', value: 'Slippage' }
-                    ], slippageValue, 'Sell 方的 Slippage');
-                }
-            }
-            
-            if (!sellSlippageVerified) {
-                log('❌ Sell 方的 Slippage 驗證失敗（已重試 3 次）', 'error');
-                return false;
-            }
-
-            // 設定 Sell 方的 Priority
-            log(`設定 Sell 方的 Priority (Gwei) 至 ${priorityValue}...`, 'info');
-            const sellPrioritySuccess = await findAndSetInput([
-                { type: 'text', text: 'Priority (Gwei)' }
-            ], priorityValue, 'Sell 方的 Priority (Gwei)');
-            
-            if (!sellPrioritySuccess) {
-                log('❌ Sell 方的 Priority 設定失敗', 'error');
-                return false;
-            }
-            
-            // 驗證 Sell 方的 Priority（重試最多 3 次）
-            let sellPriorityVerified = false;
-            for (let i = 0; i < 3; i++) {
-                await sleep(800);
-                sellPriorityVerified = await verifyInputValue('Priority (Gwei)', priorityValue);
-                if (sellPriorityVerified) {
-                    log(`✓ Sell 方的 Priority 驗證通過: ${priorityValue} gwei`, 'success');
-                    break;
-                }
-                if (i < 2) {
-                    log(`⚠️ Sell 方的 Priority 驗證失敗，重試 ${i + 1}/3...`, 'warning');
-                    await findAndSetInput([
-                        { type: 'text', text: 'Priority (Gwei)' }
-                    ], priorityValue, 'Sell 方的 Priority (Gwei)');
-                }
-            }
-            
-            if (!sellPriorityVerified) {
-                log('❌ Sell 方的 Priority 驗證失敗（已重試 3 次）', 'error');
-                return false;
-            }
-
-            // 最終驗證 Sell 方的參數（當前應該在 Sell 模式）
-            await sleep(500);
-            const finalSlippageCheck = await verifyInputValue('Slippage', slippageValue);
-            const finalPriorityCheck = await verifyInputValue('Priority (Gwei)', priorityValue);
-            
-            if (!finalSlippageCheck || !finalPriorityCheck) {
-                log('❌ 最終驗證失敗', 'error');
-                return false;
-            }
-
-            // 點擊 Save 按鈕
-            log('點擊 Save 按鈕保存設定...', 'info');
-            await sleep(500);
-            let saveButtonClicked = false;
-            
-            for (let attempt = 0; attempt < 5; attempt++) {
-                // 方法1: 通過文字 "Save" 和 bg-genius-pink 類查找
-                const allButtons = document.querySelectorAll('button');
-                for (const btn of allButtons) {
-                    const text = btn.innerText?.trim() || btn.textContent?.trim() || '';
-                    const classes = btn.className || '';
-                    
-                    if (text === 'Save' && classes.includes('bg-genius-pink')) {
-                        const rect = btn.getBoundingClientRect();
-                        const style = window.getComputedStyle(btn);
-                        
-                        if (rect.width > 0 && rect.height > 0 &&
-                            style.display !== 'none' &&
-                            style.visibility !== 'hidden' &&
-                            btn.offsetParent !== null &&
-                            !btn.disabled) {
-                            
-                            // 滾動到元素可見位置
-                            btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                            await sleep(300);
-                            
-                            btn.click();
-                            log('✓ Save 按鈕已點擊', 'success');
-                            saveButtonClicked = true;
-                            await sleep(1500);
-                            break;
-                        }
-                    }
-                }
-                
-                if (saveButtonClicked) break;
-                
-                // 方法2: 通過選擇器查找
-                if (!saveButtonClicked) {
-                    const saveBtn = document.querySelector('button.bg-genius-pink');
-                    if (saveBtn) {
-                        const text = saveBtn.innerText?.trim() || saveBtn.textContent?.trim() || '';
-                        if (text === 'Save') {
-                            const rect = saveBtn.getBoundingClientRect();
-                            const style = window.getComputedStyle(saveBtn);
-                            
-                            if (rect.width > 0 && rect.height > 0 &&
-                                style.display !== 'none' &&
-                                style.visibility !== 'hidden' &&
-                                saveBtn.offsetParent !== null &&
-                                !saveBtn.disabled) {
-                                
-                                saveBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                                await sleep(300);
-                                
-                                saveBtn.click();
-                                log('✓ Save 按鈕已點擊（通過選擇器）', 'success');
-                                saveButtonClicked = true;
-                                await sleep(1500);
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                if (saveButtonClicked) break;
-                
-                if (attempt < 4) {
-                    log(`重試查找 Save 按鈕... (${attempt + 1}/5)`, 'warning');
-                    await sleep(1000);
-                }
-            }
-            
-            if (!saveButtonClicked) {
-                log('⚠️ 未找到 Save 按鈕，但將繼續執行', 'warning');
-            }
-
-            // 關閉 Settings 面板
-            await sleep(500);
-            const closeBtn = findCloseButton();
-            if (closeBtn) {
-                closeBtn.click();
-                log('✓ 關閉 Settings 面板', 'success');
-                await sleep(800);
-            } else {
-                // 如果找不到關閉按鈕，嘗試按 ESC 鍵
-                log('嘗試使用 ESC 鍵關閉 Settings 面板...', 'info');
-                document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27 }));
-                await sleep(800);
-            }
-
-            log(`✓ 參數調整完成並驗證：Slippage=${slippageValue}%, Priority=${priorityValue} gwei`, 'success');
-            return true;
-            
-        } catch (error) {
-            log(`❌ 調整 Slippage/Priority 時出錯: ${error.message}`, 'error');
-            
-            // 嘗試關閉可能打開的 Settings 面板
-            try {
-                const closeBtn = findCloseButton();
-                if (closeBtn) {
-                    closeBtn.click();
-                    await sleep(500);
-                }
-            } catch (e) {
-                // 忽略清理錯誤
-            }
-            
-            return false;
-        }
-    }
-
     // 驗證交易成功（舊版：使用彈窗檢測 + 多重信號檢測，現已改為備用機制）
     // 注意：此函數現在主要作為備用驗證機制，主要判斷邏輯已改為 verifySwapByTokenComparison
     async function verifySwapSuccess(balanceBeforeSwap) {
@@ -4608,6 +4045,86 @@
         }
     }
 
+    // 狀態恢復函數：從暫停狀態恢復執行
+    async function resumeFromPausedState() {
+        if (!resumeFromState || currentSwapState !== SwapState.PAUSED_HIDDEN) {
+            return false;
+        }
+        
+        log('🔄 開始狀態恢復流程...', 'info');
+        
+        // 確保頁面可見
+        if (document.hidden) {
+            log('⚠️ 頁面仍不可見，等待頁面重新可見...', 'warning');
+            let waitCount = 0;
+            while (document.hidden && waitCount < 60) { // 最多等待 60 秒
+                await sleep(1000, true); // 允許在 hidden 時等待
+                waitCount++;
+            }
+            if (document.hidden) {
+                log('❌ 頁面長時間不可見，無法恢復', 'error');
+                return false;
+            }
+        }
+        
+        // 恢復到之前的狀態
+        const previousState = stateData.pausedFromState || SwapState.IDLE;
+        log(`📋 恢復到狀態: ${previousState}`, 'info');
+        
+        // 根據之前的狀態，執行相應的恢復操作
+        switch (previousState) {
+            case SwapState.CHECKING_BALANCE:
+                log('🔄 重新檢查餘額...', 'info');
+                currentSwapState = SwapState.CHECKING_BALANCE;
+                break;
+                
+            case SwapState.SELECTING_FIRST_TOKEN:
+                log('🔄 重新選擇第一個代幣...', 'info');
+                currentSwapState = SwapState.IDLE; // 重置為 IDLE，讓主循環重新開始選擇
+                break;
+                
+            case SwapState.SELECTING_SECOND_TOKEN:
+                log('🔄 重新選擇第二個代幣...', 'info');
+                currentSwapState = SwapState.IDLE; // 重置為 IDLE，讓主循環重新開始選擇
+                break;
+                
+            case SwapState.CLICKING_MAX:
+                log('🔄 重新檢查 MAX 按鈕狀態...', 'info');
+                currentSwapState = SwapState.IDLE; // 重置為 IDLE，讓主循環重新檢查
+                break;
+                
+            case SwapState.WAITING_FOR_QUOTE:
+                log('🔄 重新等待報價...', 'info');
+                currentSwapState = SwapState.IDLE; // 重置為 IDLE，讓主循環重新等待報價
+                break;
+                
+            case SwapState.CLICKING_CONFIRM:
+                log('🔄 重新檢查 Confirm 按鈕...', 'info');
+                currentSwapState = SwapState.IDLE; // 重置為 IDLE，讓主循環重新檢查
+                break;
+                
+            case SwapState.WAITING_FOR_RESULT:
+                log('🔄 檢查交易結果...', 'info');
+                currentSwapState = SwapState.IDLE; // 重置為 IDLE，讓主循環重新檢查
+                break;
+                
+            default:
+                log('🔄 恢復到初始狀態', 'info');
+                currentSwapState = SwapState.IDLE;
+        }
+        
+        // 清理暫停數據
+        stateData.pausedFromState = null;
+        stateData.pausedAt = null;
+        resumeFromState = false;
+        
+        // 等待一小段時間確保頁面完全加載
+        await sleep(1000);
+        
+        log('✅ 狀態恢復完成', 'success');
+        return true;
+    }
+
     // 主交易循環
     async function executeSwapLoop() {
         if (window.botRunning) {
@@ -4619,6 +4136,12 @@
         isRunning = true;
         stats.startTime = Date.now();
         UI.setRunning(true);
+        
+        // 初始化狀態
+        currentSwapState = SwapState.IDLE;
+        stateData = {};
+        resumeFromState = false;
+        isPageVisible = !document.hidden;
 
         // 啟用防止螢幕關閉時暫停的機制
         await requestWakeLock();
@@ -4628,6 +4151,7 @@
         log(`配置: USDC ⇄ USDT on ${CONFIG.chainDisplayName} (Optimism)`, 'info');
         log(`鏈設置: 固定使用 ${CONFIG.chainDisplayName} 鏈`, 'info');
         log(`安全設置: 餘額監控=${CONFIG.enableBalanceMonitoring}, 成功驗證=${CONFIG.enableSuccessVerification}`, 'info');
+        log('✅ 狀態機模式已啟用：支持頁面隱藏/最小化後自動恢復', 'info');
 
         // 執行 Preset 設定（在開始交易前）
         log('開始執行 Preset 設定...', 'info');
@@ -4646,7 +4170,15 @@
         }
         
         log('Preset 設定完成，開始交易循環...', 'info');
-        await sleep(2000);
+        
+        // 確保所有視窗都已完全關閉
+        if (isDialogOpen()) {
+            log('確保所有視窗已完全關閉...', 'info');
+            await ensureAllDialogsClosed(5);
+        }
+        
+        // 等待頁面完全穩定（Preset 設定完成後需要更多時間讓頁面穩定）
+        await sleep(3000);
         
         // 再次檢查是否被停止
         if (!isRunning) {
@@ -4656,17 +4188,26 @@
             return;
         }
 
-        // 初始化餘額
-        await checkBalanceSufficient();
-
-        // 重置動態調整計數器
-        if (CONFIG.enableDynamicAdjustment) {
-            consecutiveSuccesses = 0;
-            consecutiveFailures = 0;
-            currentSlippage = CONFIG.slippageInitial;
-            currentPriority = CONFIG.priorityInitial;
-            log(`🔄 動態調整已重置：Slippage=${currentSlippage.toFixed(2)}%, Priority=${currentPriority.toFixed(4)} gwei`, 'info');
-            UI.updateStats(); // 更新 UI 顯示
+        // 初始化餘額（帶重試機制）
+        log('初始化餘額檢查...', 'info');
+        let balanceCheckSuccess = false;
+        for (let retry = 0; retry < 3; retry++) {
+            const balanceResult = await checkBalanceSufficient();
+            if (balanceResult) {
+                balanceCheckSuccess = true;
+                break;
+            }
+            
+            // 如果餘額檢查失敗，可能是讀取時機不對，重試前先等待
+            if (retry < 2) {
+                log(`餘額讀取可能不準確，${2} 秒後重試... (${retry + 1}/3)`, 'info');
+                await sleep(2000);
+                if (!isRunning) break;
+            }
+        }
+        
+        if (!balanceCheckSuccess) {
+            log('⚠️ 餘額檢查失敗，但將繼續執行交易循環（將在循環中再次檢查）', 'warning');
         }
 
         await sleep(1200);
@@ -4675,11 +4216,38 @@
             try {
                 // 檢查是否已停止
                 if (!isRunning) break;
+                
+                // 檢查是否需要從暫停狀態恢復
+                if (resumeFromState && currentSwapState === SwapState.PAUSED_HIDDEN) {
+                    const resumed = await resumeFromPausedState();
+                    if (!resumed) {
+                        // 如果恢復失敗，等待後重試
+                        await sleep(2000);
+                        continue;
+                    }
+                }
+                
+                // 確保頁面可見才執行操作（除非是允許在 hidden 時執行的操作）
+                if (document.hidden && currentSwapState !== SwapState.IDLE) {
+                    // 如果頁面隱藏且不在 IDLE 狀態，進入暫停狀態
+                    if (currentSwapState !== SwapState.PAUSED_HIDDEN) {
+                        const previousState = currentSwapState;
+                        currentSwapState = SwapState.PAUSED_HIDDEN;
+                        stateData.pausedFromState = previousState;
+                        stateData.pausedAt = Date.now();
+                        resumeFromState = true;
+                        log(`⏸️ 頁面隱藏，暫停操作（從狀態 ${previousState} 暫停）`, 'warning');
+                    }
+                    // 等待頁面重新可見
+                    await sleep(1000, true); // 允許在 hidden 時等待
+                    continue;
+                }
 
                 // 檢查連續失敗次數
                 if (consecutiveFailures >= CONFIG.maxConsecutiveFailures) {
                     log(`❌ 連續失敗 ${consecutiveFailures} 次，暫停交易`, 'error');
                     log('請檢查網絡連接、餘額或頁面狀態後手動重啟', 'warning');
+                    currentSwapState = SwapState.IDLE;
                     await sleep(10000);
                     if (!isRunning) break; // 檢查是否在等待期間被停止
                     consecutiveFailures = 0; // 重置計數器，繼續嘗試
@@ -4691,6 +4259,7 @@
 
                 // 檢查按鈕加載超時
                 if (checkButtonLoadingTimeout()) {
+                    currentSwapState = SwapState.IDLE;
                     break; // 頁面將刷新，退出循環
                 }
 
@@ -4698,6 +4267,7 @@
                 if (!isRunning) break;
 
                 // 檢查餘額
+                currentSwapState = SwapState.CHECKING_BALANCE;
                 if (!await checkBalanceSufficient()) {
                     // 如果已經選擇了代幣，重新選擇幣種（選擇有餘額的幣種）
                     if (currentFromToken) {
@@ -4720,8 +4290,18 @@
                         log('✓ 重新選擇幣種成功，餘額充足', 'success');
                     } else {
                         // 如果還沒有選擇代幣，只是等待
+                        // 在等待前，先確認餘額讀取是否真的失敗（可能是讀取時機問題）
                         log('餘額不足，等待...', 'warning');
-                        await sleep(5000);
+                        
+                        // 等待期間，定期檢查是否被停止，但不要因為其他原因而停止
+                        const waitStartTime = Date.now();
+                        const waitDuration = 5000;
+                        
+                        while (Date.now() - waitStartTime < waitDuration) {
+                            if (!isRunning) break; // 只有在明確停止時才退出
+                            await sleep(1000); // 分段等待，每 1 秒檢查一次
+                        }
+                        
                         if (!isRunning) break; // 檢查是否在等待期間被停止
                         continue;
                     }
@@ -4744,42 +4324,12 @@
                 // 1. 檢查並關閉成功彈窗
                 const closeBtn = findCloseButton();
                 if (closeBtn) {
+                    currentSwapState = SwapState.CLOSING_POPUP;
                     closeBtn.click();
                     log('✓ 關閉交易完成彈窗', 'success');
                     await sleep(CONFIG.waitAfterClose);
+                    currentSwapState = SwapState.IDLE;
                     continue;
-                }
-
-                // 1.5. 新增：基於幣種比較判斷上一次 SWAP 的成功/失敗
-                // 這個判斷應該在：1) 關閉彈窗之後，2) 選擇代幣之前
-                // 此時如果有 currentFromToken，代表已經選過幣了，可以進行比較
-                // 注意：需要在重置 currentFromToken 之前進行判斷
-                if (currentFromToken) {
-                    const verifyResult = verifySwapByTokenComparison();
-                    
-                    if (verifyResult.shouldUpdate) {
-                        if (verifyResult.wasSuccess) {
-                            // 上一次 SWAP 成功
-                            stats.successfulSwaps++;
-                            stats.lastSuccessTime = Date.now();
-                            log(`✅ 統計更新：成功 +1 | 總計: ${stats.totalSwaps} | 成功: ${stats.successfulSwaps} | 失敗: ${stats.failedSwaps}`, 'success');
-                            
-                            // 動態調整（成功時）
-                            await adjustSlippageAndPriority(true);
-                        } else {
-                            // 上一次 SWAP 失敗
-                            stats.failedSwaps++;
-                            log(`❌ 統計更新：失敗 +1 | 總計: ${stats.totalSwaps} | 成功: ${stats.successfulSwaps} | 失敗: ${stats.failedSwaps}`, 'error');
-                            
-                            // 動態調整（失敗時）
-                            await adjustSlippageAndPriority(false);
-                        }
-                        
-                        UI.updateStats();
-                        
-                        // 重置標記，為下一次判斷做準備
-                        lastCycleConfirmed = false;
-                    }
                 }
 
                 // 2. 檢查是否需要選擇代幣
@@ -4788,15 +4338,14 @@
                 if (chooseBtns.length > 0) {
                     log(`檢測到 ${chooseBtns.length} 個 Choose 按鈕，開始選幣...`, 'info');
 
-                    // 注意：在重置 currentFromToken 之前，它還保留著上一次的值
-                    // 這個值已經在上一輪循環的選擇代幣完成時記錄為 lastCycleFromToken
-                    // 現在重置它，準備選擇新的代幣
+                    // 重置 currentFromToken，準備選擇新的代幣
                     currentFromToken = null;
 
                     // 檢查是否已停止
                     if (!isRunning) break;
 
                     // 點擊第一個 Choose（發送代幣）
+                    currentSwapState = SwapState.SELECTING_FIRST_TOKEN;
                     chooseBtns[0].click();
                     log('點擊第一個 Choose (發送)', 'info');
                     await sleep(CONFIG.waitAfterChoose);
@@ -4822,8 +4371,31 @@
 
                     log(`✓ 第一個代幣已設置為: ${currentFromToken}`, 'success');
 
-                    // 新增：在選擇第一個代幣完成後，記錄本次要 SWAP 的幣種（用於下次循環比較判斷）
+                    // 1.5. 新增：基於幣種比較判斷上一次 SWAP 的成功/失敗
+                    // 這個判斷應該在選擇新代幣之後進行，此時 currentFromToken 是新選擇的幣種
+                    // 比較 lastCycleFromToken（上一輪要 SWAP 的幣種）和 currentFromToken（新選擇的幣種）
                     if (currentFromToken) {
+                        const verifyResult = verifySwapByTokenComparison();
+                        
+                        if (verifyResult.shouldUpdate) {
+                            if (verifyResult.wasSuccess) {
+                                // 上一次 SWAP 成功
+                                stats.successfulSwaps++;
+                                stats.lastSuccessTime = Date.now();
+                                log(`✅ 統計更新：成功 +1 | 總計: ${stats.totalSwaps} | 成功: ${stats.successfulSwaps} | 失敗: ${stats.failedSwaps}`, 'success');
+                            } else {
+                                // 上一次 SWAP 失敗
+                                stats.failedSwaps++;
+                                log(`❌ 統計更新：失敗 +1 | 總計: ${stats.totalSwaps} | 成功: ${stats.successfulSwaps} | 失敗: ${stats.failedSwaps}`, 'error');
+                            }
+                            
+                            UI.updateStats();
+                            
+                            // 重置標記，為下一次判斷做準備
+                            lastCycleConfirmed = false;
+                        }
+                        
+                        // 記錄本次要 SWAP 的幣種（用於下次循環比較判斷）
                         lastCycleFromToken = currentFromToken;
                         log(`📝 記錄本次循環要 SWAP 的幣種: ${lastCycleFromToken}`, 'info');
                     }
@@ -4843,6 +4415,7 @@
                         // 如果使用 findAllTokenSelectionButtons 且找到至少 2 個按鈕，點擊第二個
                         // 否則點擊第一個（因為 findChooseButtons 只會返回未選擇的按鈕）
                         const btnToClick = (allTokenBtns.length >= 2 && chooseBtns2 === allTokenBtns) ? chooseBtns2[1] : chooseBtns2[0];
+                        currentSwapState = SwapState.SELECTING_SECOND_TOKEN;
                         btnToClick.click();
                         log('點擊第二個 Choose (接收)', 'info');
                         await sleep(CONFIG.waitAfterChoose);
@@ -4895,12 +4468,14 @@
                     } else {
                         log('找不到切換按鈕', 'error');
                         consecutiveFailures++;
+                        currentSwapState = SwapState.IDLE;
                         await sleep(2000);
                         continue;
                     }
                 }
 
                 if (maxBtn && !maxBtn.disabled) {
+                    currentSwapState = SwapState.CLICKING_MAX;
                     maxBtn.click();
                     log('✓ 點擊 MAX', 'success');
                     await sleep(CONFIG.waitAfterMax);
@@ -4911,11 +4486,13 @@
                 } else if (!maxBtn) {
                     log('未找到 MAX 按鈕', 'warning');
                     consecutiveFailures++;
+                    currentSwapState = SwapState.IDLE;
                     await sleep(2000);
                     continue;
                 }
 
                 // 4. 等待報價完成後點擊 Confirm
+                currentSwapState = SwapState.WAITING_FOR_QUOTE;
                 log('⏳ 開始等待報價完成...', 'info');
                 const quoteReady = await waitForQuoteReady();
                 
@@ -5010,6 +4587,7 @@
                 }
 
                 let confirmClicked = false;
+                currentSwapState = SwapState.CLICKING_CONFIRM;
 
                 for (let i = 0; i < CONFIG.maxRetryConfirm; i++) {
                     // 在每次重試前檢查 loading 狀態
@@ -5063,6 +4641,9 @@
                             log(`📝 標記：本次交易已提交，總交易次數: ${stats.totalSwaps}`, 'info');
                             UI.updateStats();
                             
+                            // 更新狀態為等待結果
+                            currentSwapState = SwapState.WAITING_FOR_RESULT;
+                            
                             break;
                         } catch (error) {
                             log(`⚠️ 點擊 Confirm 時發生錯誤: ${error.message}，繼續重試...`, 'warning');
@@ -5077,18 +4658,21 @@
                 if (!confirmClicked) {
                     log('❌ Confirm 未成功，重試...', 'error');
                     consecutiveFailures++;
+                    currentSwapState = SwapState.IDLE;
                     // 注意：Confirm 未點擊成功，不算一次真正的交易嘗試，不增加 totalSwaps
                     await sleep(2000);
                     continue;
                 }
 
                 // 5. 等待交易提交並進入下一輪（成功/失敗判斷將在下一輪循環開始時透過幣種比較完成）
+                currentSwapState = SwapState.WAITING_FOR_RESULT;
                 await sleep(CONFIG.waitAfterConfirm);
 
                 // 嘗試關閉可能出現的成功彈窗（不等待，非阻塞）
                 await sleep(1000);
                 const closeAfterConfirm = findCloseButton();
                 if (closeAfterConfirm) {
+                    currentSwapState = SwapState.CLOSING_POPUP;
                     closeAfterConfirm.click();
                     log('✓ 關閉彈窗', 'success');
                     await sleep(CONFIG.waitAfterClose);
@@ -5099,6 +4683,7 @@
 
                 // 隨機等待後繼續下一輪
                 // 注意：成功/失敗的判斷將在下一輪循環開始時透過幣種比較完成
+                currentSwapState = SwapState.IDLE; // 重置為 IDLE，準備下一輪
                 const randomWaitTime = randomWait(CONFIG.waitAfterTradeMin, CONFIG.waitAfterTradeMax);
                 log(`✓ 交易已提交！總計: ${stats.totalSwaps} 次`, 'success');
                 log(`⏳ 成功/失敗判斷將在下一輪循環開始時透過幣種比較完成`, 'info');
@@ -5156,16 +4741,14 @@
         stopHeartbeat();
         releaseWakeLock();
 
+        // 重置狀態機
+        currentSwapState = SwapState.IDLE;
+        stateData = {};
+        resumeFromState = false;
+
         // 重置幣種比較判斷相關的變數
         lastCycleFromToken = null;
         lastCycleConfirmed = false;
-
-        // 重置動態調整相關的變數
-        if (CONFIG.enableDynamicAdjustment) {
-            isAdjusting = false;
-            pendingAdjustment = null;
-            log('🔄 已重置動態調整狀態', 'info');
-        }
 
         // 計算運行時間
         const runtime = stats.startTime ? Math.floor((Date.now() - stats.startTime) / 1000) : 0;
@@ -5273,8 +4856,8 @@
             statsDiv.innerHTML = `
         <div style="font-weight: 700; margin-bottom: 4px;">統計</div>
         <div>總計: <span id="stat-total">0</span> | 成功: <span id="stat-success">0</span> | 失敗: <span id="stat-fail">0</span></div>
-        <div style="margin-top: 4px;">連續成功: <span id="stat-consecutive-success" style="color: #10b981;">0</span> | 連續失敗: <span id="stat-consecutive-fail" style="color: #ef4444;">0</span></div>
-        <div style="margin-top: 4px;">Slippage: <span id="stat-slippage" style="color: #3b82f6;">${CONFIG.enableDynamicAdjustment ? CONFIG.slippageInitial.toFixed(2) : '0.10'}%</span> | Priority: <span id="stat-priority" style="color: #3b82f6;">${CONFIG.enableDynamicAdjustment ? CONFIG.priorityInitial.toFixed(4) : '0.0020'} gwei</span></div>
+        <div style="margin-top: 4px;">連續失敗: <span id="stat-consecutive-fail" style="color: #ef4444;">0</span></div>
+        <div style="margin-top: 4px;">Slippage: <span id="stat-slippage" style="color: #3b82f6;">${CONFIG.slippageValue.toFixed(2)}%</span> | Priority: <span id="stat-priority" style="color: #3b82f6;">${CONFIG.priorityValue.toFixed(4)} gwei</span></div>
       `;
 
             const logEl = document.createElement('pre');
@@ -5326,7 +4909,6 @@
             const totalEl = this.statsEl.querySelector('#stat-total');
             const successEl = this.statsEl.querySelector('#stat-success');
             const failEl = this.statsEl.querySelector('#stat-fail');
-            const consecutiveSuccessEl = this.statsEl.querySelector('#stat-consecutive-success');
             const consecutiveFailEl = this.statsEl.querySelector('#stat-consecutive-fail');
             const slippageEl = this.statsEl.querySelector('#stat-slippage');
             const priorityEl = this.statsEl.querySelector('#stat-priority');
@@ -5335,20 +4917,17 @@
             if (successEl) successEl.textContent = stats.successfulSwaps;
             if (failEl) failEl.textContent = stats.failedSwaps;
             
-            // 更新連續成功/失敗次數
-            if (consecutiveSuccessEl && CONFIG.enableDynamicAdjustment) {
-                consecutiveSuccessEl.textContent = consecutiveSuccesses;
-            }
-            if (consecutiveFailEl && CONFIG.enableDynamicAdjustment) {
+            // 更新連續失敗次數
+            if (consecutiveFailEl) {
                 consecutiveFailEl.textContent = consecutiveFailures;
             }
             
-            // 更新 Slippage 和 Priority
-            if (slippageEl && CONFIG.enableDynamicAdjustment) {
-                slippageEl.textContent = `${currentSlippage.toFixed(2)}%`;
+            // 顯示固定的 Slippage 和 Priority 值
+            if (slippageEl) {
+                slippageEl.textContent = `${CONFIG.slippageValue.toFixed(2)}%`;
             }
-            if (priorityEl && CONFIG.enableDynamicAdjustment) {
-                priorityEl.textContent = `${currentPriority.toFixed(4)} gwei`;
+            if (priorityEl) {
+                priorityEl.textContent = `${CONFIG.priorityValue.toFixed(4)} gwei`;
             }
         },
 
