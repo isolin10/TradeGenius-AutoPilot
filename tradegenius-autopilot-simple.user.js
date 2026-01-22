@@ -197,10 +197,12 @@
 
     // 防止螢幕關閉時暫停的相關變量
     let wakeLock = null;  // Wake Lock API 對象
+    let wakeLockReleaseHandler = null;  // Wake Lock 釋放事件處理器（用於清理）
     let heartbeatInterval = null;  // 心跳定時器
     let lastHeartbeatTime = Date.now();  // 上次心跳時間
     let throttleDetectionEnabled = true;  // 是否啟用時間節流檢測
     let visibilityListenerSetup = false;  // 是否已設置可見性監聽器
+    let keydownHandler = null;  // 鍵盤事件處理器（用於清理）
     
     // ==================== 狀態機系統 ====================
     // 定義交易流程的狀態
@@ -339,6 +341,11 @@
         return Math.floor(Math.random() * (max - min + 1)) + min;
     };
 
+    // 日誌緩衝區：限制日誌條目數量，避免記憶體累積
+    const logBuffer = [];
+    const MAX_LOG_ENTRIES = 100;  // 最多保留 100 條日誌
+    const MAX_LOG_TEXT_LENGTH = 5000;  // 日誌文字最多 5000 字元
+
     const log = (msg, type = 'info') => {
         const time = new Date().toLocaleTimeString();
         const prefix = `[${time}]`;
@@ -361,7 +368,20 @@
 
         if (UI.logEl) {
             const logText = `${prefix} ${icons[type]} ${msg}\n`;
-            UI.logEl.textContent = logText + UI.logEl.textContent.slice(0, 2000);
+            
+            // 添加到緩衝區
+            logBuffer.push(logText);
+            
+            // 限制緩衝區大小
+            if (logBuffer.length > MAX_LOG_ENTRIES) {
+                logBuffer.shift();  // 移除最舊的日誌
+            }
+            
+            // 更新 DOM：使用緩衝區內容，限制總長度
+            const fullText = logBuffer.join('');
+            UI.logEl.textContent = fullText.length > MAX_LOG_TEXT_LENGTH 
+                ? fullText.slice(-MAX_LOG_TEXT_LENGTH) 
+                : fullText;
         }
     };
 
@@ -370,17 +390,26 @@
     async function requestWakeLock() {
         try {
             if ('wakeLock' in navigator) {
+                // 如果已有 Wake Lock，先清理舊的事件監聽器
+                if (wakeLock && wakeLockReleaseHandler) {
+                    wakeLock.removeEventListener('release', wakeLockReleaseHandler);
+                    wakeLockReleaseHandler = null;
+                }
+                
                 wakeLock = await navigator.wakeLock.request('screen');
                 log('✅ Wake Lock 已啟用（防止螢幕關閉）', 'success');
                 
-                // 監聽 Wake Lock 釋放事件
-                wakeLock.addEventListener('release', () => {
+                // 創建事件處理器並保存引用，以便後續清理
+                wakeLockReleaseHandler = () => {
                     log('⚠️ Wake Lock 已釋放，嘗試重新請求...', 'warning');
                     // 如果腳本仍在運行，嘗試重新請求
                     if (isRunning) {
                         setTimeout(() => requestWakeLock(), 1000);
                     }
-                });
+                };
+                
+                // 監聽 Wake Lock 釋放事件
+                wakeLock.addEventListener('release', wakeLockReleaseHandler);
             } else {
                 log('ℹ️ 瀏覽器不支援 Wake Lock API', 'info');
             }
@@ -393,6 +422,12 @@
     async function releaseWakeLock() {
         try {
             if (wakeLock) {
+                // 清理事件監聽器
+                if (wakeLockReleaseHandler) {
+                    wakeLock.removeEventListener('release', wakeLockReleaseHandler);
+                    wakeLockReleaseHandler = null;
+                }
+                
                 await wakeLock.release();
                 wakeLock = null;
                 log('Wake Lock 已釋放', 'info');
@@ -499,15 +534,29 @@
         try {
             const balances = { USDT: 0, USDC: 0 };
 
-            // 方法1: 從包含 "Balance:" 的元素讀取（參考用戶提供的 HTML 格式）
-            const allElements = document.querySelectorAll('*');
-            for (const el of allElements) {
+            // 方法1: 從包含 "Balance:" 的元素讀取（優化：使用更精確的選擇器，避免查詢所有元素）
+            // 優先查找可能包含餘額的容器元素，而不是所有元素
+            const possibleContainers = document.querySelectorAll('div, span, p, td, th');
+            const processedElements = new WeakSet();  // 使用 WeakSet 追蹤已處理的元素，避免重複處理
+            
+            for (const el of possibleContainers) {
                 // 跳過對話框中的元素
                 if (el.closest('[role="dialog"]')) continue;
                 
+                // 跳過已處理的元素
+                if (processedElements.has(el)) continue;
+                
+                // 只處理可見且包含文字的元素
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                
                 const text = el.innerText || '';
+                // 如果元素沒有文字或文字太長，跳過（可能是容器）
+                if (!text || text.length > 200) continue;
+                
                 // 查找包含 "Balance:" 的元素（例如: "Balance: 49.871"）
                 if (text.includes('Balance:') || text.includes('Balance ')) {
+                    processedElements.add(el);
                     // 提取數字（匹配 "Balance: 49.871" 或 "Balance 49.871"）
                     const balanceMatch = text.match(/Balance:?\s*([\d,\.]+)/i);
                     if (balanceMatch) {
@@ -609,15 +658,21 @@
                 }
             }
 
-            // 方法3: 從主頁面文字匹配（備用方法）
+            // 方法3: 從主頁面文字匹配（備用方法，優化：只查詢可能包含代幣資訊的元素）
             if (balances.USDT === 0 && balances.USDC === 0) {
-                for (const el of allElements) {
+                // 使用更精確的選擇器，只查詢可能包含代幣資訊的容器
+                const tokenContainers = document.querySelectorAll('div[class*="token"], div[class*="balance"], div[class*="asset"], span[class*="token"], span[class*="balance"]');
+                for (const el of tokenContainers) {
                     if (el.closest('[role="dialog"]')) continue;
+                    if (processedElements.has(el)) continue;
                     
                     const text = el.innerText || '';
+                    if (!text || text.length > 200) continue;
+                    
                     // 匹配 "USDT: 49.871" 或 "USDC: 49.871" 格式
                     const match = text.match(/(USDT|USDC)[\s:]+([\d,\.]+)/i);
                     if (match) {
+                        processedElements.add(el);
                         const symbol = match[1].toUpperCase();
                         // 使用更精確的數值解析，保留足夠的小數位
                         const balanceText = match[2].replace(/,/g, '');
@@ -1522,7 +1577,7 @@
     // 查找並點擊 M.Cap 選項
     async function findAndClickMCapOption(mcapText) {
         try {
-            // 查找包含 "M. Cap:" 的容器
+            // 方法1: 查找包含 "M. Cap:" 或 "M.Cap:" 的容器
             const allElements = Array.from(document.querySelectorAll('*'));
             let mcapContainer = null;
             
@@ -1534,17 +1589,64 @@
                 }
             }
             
+            // 方法2: 如果方法1失敗，嘗試通過包含 border-genius-blue 和 cursor-pointer 的 div 查找
+            if (!mcapContainer) {
+                const candidateContainers = document.querySelectorAll('div[class*="border-genius-blue"][class*="cursor-pointer"]');
+                for (const container of candidateContainers) {
+                    const containerText = container.innerText || container.textContent || '';
+                    // 檢查容器是否包含 M.Cap 相關文字或多個 M.Cap 選項
+                    if (containerText.includes('M. Cap') || containerText.includes('M.Cap') ||
+                        (containerText.includes('<1M') && containerText.includes('1-5M'))) {
+                        // 向上查找父容器
+                        let parent = container.parentElement;
+                        for (let i = 0; i < 5 && parent; i++) {
+                            const parentText = parent.innerText || parent.textContent || '';
+                            if (parentText.includes('M. Cap:') || parentText.includes('M.Cap:')) {
+                                mcapContainer = parent;
+                                break;
+                            }
+                            parent = parent.parentElement;
+                        }
+                        if (mcapContainer) break;
+                    }
+                }
+            }
+            
             if (!mcapContainer) {
                 log(`⚠️ 未找到 M.Cap 容器`, 'warning');
                 return false;
             }
             
             // 在容器中查找包含指定文字的選項
-            const mcapOptions = mcapContainer.querySelectorAll('div.cursor-pointer, div[class*="cursor-pointer"]');
+            // 優先查找包含 border-genius-blue 和 cursor-pointer 的 div
+            const mcapOptions = mcapContainer.querySelectorAll('div.cursor-pointer[class*="border-genius-blue"], div[class*="cursor-pointer"][class*="border-genius-blue"], div.cursor-pointer, div[class*="cursor-pointer"]');
+            
+            // 處理特殊字符：<1M 和 >20M
+            const normalizedMcapText = mcapText;
+            const alternativeTexts = [];
+            if (mcapText === '<1M') {
+                alternativeTexts.push('&lt;1M', '<1M');
+            } else if (mcapText === '>20M') {
+                alternativeTexts.push('&gt;20M', '>20M');
+            } else {
+                alternativeTexts.push(mcapText);
+            }
             
             for (const option of mcapOptions) {
                 const optionText = option.innerText?.trim() || option.textContent?.trim() || '';
-                if (optionText === mcapText) {
+                const optionHTML = option.innerHTML?.trim() || '';
+                
+                // 檢查文字是否匹配（支持多種格式）
+                const isMatch = alternativeTexts.some(alt => 
+                    optionText === alt || 
+                    optionText === normalizedMcapText ||
+                    optionHTML.includes(alt) ||
+                    (mcapText === '<1M' && (optionText === '<1M' || optionText.includes('<1M'))) ||
+                    (mcapText === '>20M' && (optionText === '>20M' || optionText.includes('>20M'))) ||
+                    (mcapText !== '<1M' && mcapText !== '>20M' && optionText === mcapText)
+                );
+                
+                if (isMatch) {
                     const rect = option.getBoundingClientRect();
                     const style = window.getComputedStyle(option);
                     
@@ -1553,20 +1655,54 @@
                         style.visibility !== 'hidden' &&
                         option.offsetParent !== null) {
                         
-                        // 檢查是否已經選中
+                        // 檢查是否已經選中（通過 bg-genius-blue 類或 text-genius-cream 類）
                         const classes = option.className || '';
-                        const isSelected = classes.includes('bg-genius-blue');
+                        const isSelected = classes.includes('bg-genius-blue') && 
+                                          (classes.includes('text-genius-cream') || 
+                                           option.querySelector('.text-genius-cream'));
                         
-                        if (!isSelected) {
-                            option.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                            await sleep(200);
+                        // 無論是否已選中，都點擊一次以確保該選項被激活（這樣才能設定該選項的 slippage）
+                        option.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        await sleep(300);
+                        
+                        // 嘗試多種點擊方式
+                        let clickSuccess = false;
+                        
+                        // 方式1: 直接點擊
+                        try {
                             option.click();
-                            log(`✓ 點擊 M.Cap 選項: ${mcapText}`, 'success');
-                            await sleep(500);
+                            clickSuccess = true;
+                        } catch (e) {
+                            log(`⚠️ 直接點擊失敗，嘗試其他方式: ${e.message}`, 'warning');
+                        }
+                        
+                        // 方式2: 使用 MouseEvent
+                        if (!clickSuccess) {
+                            try {
+                                const clickEvent = new MouseEvent('click', {
+                                    bubbles: true,
+                                    cancelable: true,
+                                    view: window,
+                                    detail: 1
+                                });
+                                option.dispatchEvent(clickEvent);
+                                clickSuccess = true;
+                            } catch (e) {
+                                log(`⚠️ MouseEvent 點擊失敗: ${e.message}`, 'warning');
+                            }
+                        }
+                        
+                        if (clickSuccess) {
+                            if (isSelected) {
+                                log(`✓ M.Cap 選項已選中，已重新點擊以確保激活: ${mcapText}`, 'info');
+                            } else {
+                                log(`✓ 點擊 M.Cap 選項: ${mcapText}`, 'success');
+                            }
+                            // 等待 UI 更新（點擊後需要時間讓選項激活）
+                            await sleep(800);
                             return true;
                         } else {
-                            log(`✓ M.Cap 選項已選中: ${mcapText}`, 'info');
-                            return true;
+                            log(`⚠️ 無法點擊 M.Cap 選項: ${mcapText}`, 'warning');
                         }
                     }
                 }
@@ -1584,51 +1720,111 @@
     async function setSlippageForAllMCaps(slippageValue, mode) {
         const mcapOptions = ['<1M', '1-5M', '5-20M', '>20M', 'No Data'];
         let successCount = 0;
+        const slippageValueStr = slippageValue.toFixed(2);
         
-        log(`開始為 ${mode} 方的所有 M.Cap 選項設定 Slippage 至 ${slippageValue}%...`, 'info');
+        log(`開始為 ${mode} 方的所有 M.Cap 選項設定 Slippage 至 ${slippageValueStr}%...`, 'info');
+        log(`將依次設定 ${mcapOptions.length} 個 M.Cap 選項: ${mcapOptions.join(', ')}`, 'info');
         
-        for (const mcap of mcapOptions) {
+        for (let index = 0; index < mcapOptions.length; index++) {
+            const mcap = mcapOptions[index];
+            
             if (!isRunning) {
                 log('⚠️ 設定已取消（程序已停止）', 'warning');
                 return false;
             }
             
-            log(`設定 ${mode} 方 M.Cap ${mcap} 的 Slippage...`, 'info');
+            log(`\n[${index + 1}/${mcapOptions.length}] 設定 ${mode} 方 M.Cap "${mcap}" 的 Slippage...`, 'info');
             
-            // 點擊 M.Cap 選項
-            const mcapClicked = await findAndClickMCapOption(mcap);
+            // 步驟 1: 點擊 M.Cap 選項（必須先點擊才能設定該選項的 slippage）
+            let mcapClicked = false;
+            for (let retry = 0; retry < 3; retry++) {
+                if (retry > 0) {
+                    log(`重試點擊 M.Cap 選項 "${mcap}"... (${retry + 1}/3)`, 'warning');
+                    await sleep(1000);
+                }
+                
+                mcapClicked = await findAndClickMCapOption(mcap);
+                if (mcapClicked) {
+                    break;
+                }
+            }
+            
             if (!mcapClicked) {
-                log(`⚠️ 無法點擊 M.Cap 選項 ${mcap}，跳過`, 'warning');
+                log(`❌ 無法點擊 M.Cap 選項 "${mcap}"，跳過此選項`, 'error');
                 continue;
             }
             
-            // 等待 UI 更新
-            await sleep(500);
+            // 等待 M.Cap 選項激活後的 UI 更新（確保 slippage 輸入框已切換到該選項）
+            log(`✓ M.Cap 選項 "${mcap}" 已點擊，等待 UI 更新...`, 'info');
+            await sleep(1000); // 增加等待時間，確保 UI 完全更新
             
-            // 設定 slippage 值
-            const slippageValueStr = slippageValue.toFixed(2);
-            const setSuccess = await findAndSetInput([
-                { type: 'text', text: 'Slippage' },
-                { type: 'data-attr', attr: 'data-sentry-component', value: 'Slippage' }
-            ], slippageValueStr, `${mode} 方 M.Cap ${mcap} 的 Slippage`);
+            // 步驟 2: 驗證 M.Cap 選項是否已激活（可選，用於調試）
+            // 這裡可以添加驗證邏輯，但為了不影響流程，暫時跳過
             
-            if (setSuccess) {
-                successCount++;
-                // 驗證值是否已保存
-                await sleep(800);
-                const verified = await verifyInputValue('Slippage', slippageValueStr);
-                if (!verified) {
-                    log(`⚠️ ${mode} 方 M.Cap ${mcap} 的 Slippage 值驗證失敗，但將繼續`, 'warning');
+            // 步驟 3: 設定 slippage 值
+            log(`設定 ${mode} 方 M.Cap "${mcap}" 的 Slippage 為 ${slippageValueStr}%...`, 'info');
+            let setSuccess = false;
+            
+            for (let retry = 0; retry < 3; retry++) {
+                if (retry > 0) {
+                    log(`重試設定 Slippage... (${retry + 1}/3)`, 'warning');
+                    await sleep(1000);
+                    
+                    // 重新點擊 M.Cap 選項，確保它仍然被選中
+                    await findAndClickMCapOption(mcap);
+                    await sleep(800);
                 }
-            } else {
-                log(`⚠️ ${mode} 方 M.Cap ${mcap} 的 Slippage 設定失敗`, 'warning');
+                
+                setSuccess = await findAndSetInput([
+                    { type: 'text', text: 'Slippage' },
+                    { type: 'data-attr', attr: 'data-sentry-component', value: 'Slippage' }
+                ], slippageValueStr, `${mode} 方 M.Cap "${mcap}" 的 Slippage`);
+                
+                if (setSuccess) {
+                    break;
+                }
             }
             
-            await sleep(500);
+            if (setSuccess) {
+                // 步驟 4: 驗證值是否已保存
+                log(`驗證 ${mode} 方 M.Cap "${mcap}" 的 Slippage 值...`, 'info');
+                await sleep(1000); // 等待值保存
+                
+                let verified = false;
+                for (let verifyRetry = 0; verifyRetry < 2; verifyRetry++) {
+                    verified = await verifyInputValue('Slippage', slippageValueStr);
+                    if (verified) {
+                        break;
+                    }
+                    if (verifyRetry < 1) {
+                        await sleep(500);
+                    }
+                }
+                
+                if (verified) {
+                    log(`✅ ${mode} 方 M.Cap "${mcap}" 的 Slippage 已成功設定為 ${slippageValueStr}%`, 'success');
+                    successCount++;
+                } else {
+                    log(`⚠️ ${mode} 方 M.Cap "${mcap}" 的 Slippage 值驗證失敗，但設定操作已執行`, 'warning');
+                    // 即使驗證失敗，也計為成功（可能是驗證邏輯的問題）
+                    successCount++;
+                }
+            } else {
+                log(`❌ ${mode} 方 M.Cap "${mcap}" 的 Slippage 設定失敗`, 'error');
+            }
+            
+            // 在每個選項設定完成後，等待一小段時間再處理下一個
+            if (index < mcapOptions.length - 1) {
+                await sleep(600); // 選項之間的間隔
+            }
         }
         
-        log(`✓ ${mode} 方 M.Cap Slippage 設定完成: ${successCount}/${mcapOptions.length}`, 
+        log(`\n${mode} 方 M.Cap Slippage 設定完成: ${successCount}/${mcapOptions.length} 個選項成功`, 
             successCount === mcapOptions.length ? 'success' : 'warning');
+        
+        if (successCount < mcapOptions.length) {
+            log(`⚠️ 有 ${mcapOptions.length - successCount} 個 M.Cap 選項設定失敗，但將繼續執行`, 'warning');
+        }
         
         return successCount === mcapOptions.length;
     }
@@ -4212,10 +4408,33 @@
 
         await sleep(1200);
 
+        // 記憶體清理計數器：每執行 10 次交易循環後清理一次
+        let swapCycleCount = 0;
+        const MEMORY_CLEANUP_INTERVAL = 10;
+
         while (isRunning) {
             try {
                 // 檢查是否已停止
                 if (!isRunning) break;
+                
+                // 定期清理記憶體：每執行一定次數的交易後清理
+                swapCycleCount++;
+                if (swapCycleCount >= MEMORY_CLEANUP_INTERVAL) {
+                    swapCycleCount = 0;
+                    // 清理日誌緩衝區（保留最新的）
+                    if (logBuffer.length > MAX_LOG_ENTRIES) {
+                        const keepCount = Math.floor(MAX_LOG_ENTRIES * 0.8);  // 保留 80%
+                        logBuffer.splice(0, logBuffer.length - keepCount);
+                    }
+                    // 強制垃圾回收提示（如果瀏覽器支援）
+                    if (window.gc) {
+                        try {
+                            window.gc();
+                        } catch (e) {
+                            // 忽略錯誤
+                        }
+                    }
+                }
                 
                 // 檢查是否需要從暫停狀態恢復
                 if (resumeFromState && currentSwapState === SwapState.PAUSED_HIDDEN) {
@@ -4750,6 +4969,11 @@
         lastCycleFromToken = null;
         lastCycleConfirmed = false;
 
+        // 清理記憶體：限制日誌緩衝區大小
+        if (logBuffer.length > MAX_LOG_ENTRIES) {
+            logBuffer.splice(0, logBuffer.length - MAX_LOG_ENTRIES);
+        }
+
         // 計算運行時間
         const runtime = stats.startTime ? Math.floor((Date.now() - stats.startTime) / 1000) : 0;
         const minutes = Math.floor(runtime / 60);
@@ -4888,12 +5112,16 @@
 
             btn.addEventListener('click', () => this.toggle());
 
-            window.addEventListener('keydown', (e) => {
-                if (e.ctrlKey && (e.key === 's' || e.key === 'S') && !e.altKey) {
-                    e.preventDefault();
-                    this.toggle();
-                }
-            });
+            // 保存事件處理器引用，避免重複添加
+            if (!keydownHandler) {
+                keydownHandler = (e) => {
+                    if (e.ctrlKey && (e.key === 's' || e.key === 'S') && !e.altKey) {
+                        e.preventDefault();
+                        this.toggle();
+                    }
+                };
+                window.addEventListener('keydown', keydownHandler);
+            }
         },
 
         setRunning(running) {

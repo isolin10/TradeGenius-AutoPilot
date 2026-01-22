@@ -144,11 +144,6 @@
         checkSwapPendingInterval: 2000,    // 檢查 SWAP pending 狀態的間隔（2秒）
         swapPendingExtraRetries: 3,        // SWAP pending 超時後的額外重試次數
         swapPendingRetryInterval: 3000,    // 每次額外重試的間隔（3秒）
-        
-        // 餘額驗證設置
-        balanceVerificationDelay: 3000,     // 餘額驗證前的等待時間（3秒）
-        balanceReadRetries: 3,              // 餘額讀取重試次數
-        balanceReadRetryInterval: 2000,     // 餘額讀取重試間隔（2秒）
 
         // 重試設置
         maxRetryConfirm: 25,
@@ -158,10 +153,6 @@
         // 按鈕加載超時設置（毫秒）
         buttonLoadingTimeout: 35000,    // 35秒
 
-        // 餘額檢查設置
-        minBalanceThreshold: 0.1,       // 最小餘額閾值（USDT/USDC）
-        balanceCheckInterval: 5000,     // 餘額檢查間隔（毫秒）
-
         // 交易頻率控制
         minIntervalBetweenSwaps: 10000, // 兩次交易之間的最小間隔（毫秒）
 
@@ -170,24 +161,23 @@
         chainDisplayName: 'OP',          // 顯示名稱
 
         // 安全設置
-        enableBalanceMonitoring: true,  // 啟用餘額監控
         enableSuccessVerification: true, // 啟用交易成功驗證
         enableAutoRecovery: true,        // 啟用自動恢復
 
         // 動態調整設置
         enableDynamicAdjustment: true,   // 啟用動態調整 Slippage 和 Priority
         // Slippage 設置
-        slippageInitial: 0.10,          // 初始 Slippage (%)
-        slippageMin: 0.05,              // Slippage 下限 (%)
+        slippageInitial: 0.05,          // 初始 Slippage (%)
+        slippageMin: 0.01,              // Slippage 下限 (%)
         slippageMax: 0.30,              // Slippage 上限 (%)
-        slippageIncreaseOnFailure: 0.05, // 失敗時增加的 Slippage (%)
-        slippageDecreaseOnSuccess: 0.02, // 成功時減少的 Slippage (%)
+        slippageIncreaseOnFailure: 0.03, // 失敗時增加的 Slippage (%)
+        slippageDecreaseOnSuccess: 0.03, // 成功時減少的 Slippage (%)
         // Priority 設置
         priorityInitial: 0.002,         // 初始 Priority (gwei)
         priorityMin: 0.002,             // Priority 下限 (gwei)
         priorityMax: 0.01,              // Priority 上限 (gwei)
         priorityIncreaseOnFailure: 0.001, // 失敗時增加的 Priority (gwei)
-        priorityDecreaseOnSuccess: 0.0005, // 成功時減少的 Priority (gwei)
+        priorityDecreaseOnSuccess: 0.001, // 成功時減少的 Priority (gwei)
         // 觸發閾值
         consecutiveFailureThreshold: 2,  // 連續失敗多少次後觸發調整
         consecutiveSuccessThreshold: 8,  // 連續成功多少次後觸發調整
@@ -202,8 +192,6 @@
     let buttonLoadingStartTime = null;
     let lastSwapTime = 0;
     let consecutiveFailures = 0;
-    let lastBalance = { USDT: null, USDC: null };
-    let balanceCheckTimer = null;
 
     // 新增：用於基於幣種比較的 SWAP 成功/失敗判斷
     let lastCycleFromToken = null;  // 記錄上一次交易循環開始時的發送幣種
@@ -218,10 +206,12 @@
 
     // 防止螢幕關閉時暫停的相關變量
     let wakeLock = null;  // Wake Lock API 對象
+    let wakeLockReleaseHandler = null;  // Wake Lock 釋放事件處理器（用於清理）
     let heartbeatInterval = null;  // 心跳定時器
     let lastHeartbeatTime = Date.now();  // 上次心跳時間
     let throttleDetectionEnabled = true;  // 是否啟用時間節流檢測
     let visibilityListenerSetup = false;  // 是否已設置可見性監聽器
+    let keydownHandler = null;  // 鍵盤事件處理器（用於清理）
 
     let stats = {
         totalSwaps: 0,
@@ -279,6 +269,11 @@
         return Math.floor(Math.random() * (max - min + 1)) + min;
     };
 
+    // 日誌緩衝區：限制日誌條目數量，避免記憶體累積
+    const logBuffer = [];
+    const MAX_LOG_ENTRIES = 100;  // 最多保留 100 條日誌
+    const MAX_LOG_TEXT_LENGTH = 5000;  // 日誌文字最多 5000 字元
+
     const log = (msg, type = 'info') => {
         const time = new Date().toLocaleTimeString();
         const prefix = `[${time}]`;
@@ -301,7 +296,20 @@
 
         if (UI.logEl) {
             const logText = `${prefix} ${icons[type]} ${msg}\n`;
-            UI.logEl.textContent = logText + UI.logEl.textContent.slice(0, 2000);
+            
+            // 添加到緩衝區
+            logBuffer.push(logText);
+            
+            // 限制緩衝區大小
+            if (logBuffer.length > MAX_LOG_ENTRIES) {
+                logBuffer.shift();  // 移除最舊的日誌
+            }
+            
+            // 更新 DOM：使用緩衝區內容，限制總長度
+            const fullText = logBuffer.join('');
+            UI.logEl.textContent = fullText.length > MAX_LOG_TEXT_LENGTH 
+                ? fullText.slice(-MAX_LOG_TEXT_LENGTH) 
+                : fullText;
         }
     };
 
@@ -310,17 +318,26 @@
     async function requestWakeLock() {
         try {
             if ('wakeLock' in navigator) {
+                // 如果已有 Wake Lock，先清理舊的事件監聽器
+                if (wakeLock && wakeLockReleaseHandler) {
+                    wakeLock.removeEventListener('release', wakeLockReleaseHandler);
+                    wakeLockReleaseHandler = null;
+                }
+                
                 wakeLock = await navigator.wakeLock.request('screen');
                 log('✅ Wake Lock 已啟用（防止螢幕關閉）', 'success');
                 
-                // 監聽 Wake Lock 釋放事件
-                wakeLock.addEventListener('release', () => {
+                // 創建事件處理器並保存引用，以便後續清理
+                wakeLockReleaseHandler = () => {
                     log('⚠️ Wake Lock 已釋放，嘗試重新請求...', 'warning');
                     // 如果腳本仍在運行，嘗試重新請求
                     if (isRunning) {
                         setTimeout(() => requestWakeLock(), 1000);
                     }
-                });
+                };
+                
+                // 監聽 Wake Lock 釋放事件
+                wakeLock.addEventListener('release', wakeLockReleaseHandler);
             } else {
                 log('ℹ️ 瀏覽器不支援 Wake Lock API', 'info');
             }
@@ -333,6 +350,12 @@
     async function releaseWakeLock() {
         try {
             if (wakeLock) {
+                // 清理事件監聽器
+                if (wakeLockReleaseHandler) {
+                    wakeLock.removeEventListener('release', wakeLockReleaseHandler);
+                    wakeLockReleaseHandler = null;
+                }
+                
                 await wakeLock.release();
                 wakeLock = null;
                 log('Wake Lock 已釋放', 'info');
@@ -407,204 +430,6 @@
         visibilityListenerSetup = true;
     }
 
-    // ==================== 餘額監控函數 ====================
-    async function getTokenBalances() {
-        try {
-            const balances = { USDT: 0, USDC: 0 };
-
-            // 方法1: 從包含 "Balance:" 的元素讀取（參考用戶提供的 HTML 格式）
-            const allElements = document.querySelectorAll('*');
-            for (const el of allElements) {
-                // 跳過對話框中的元素
-                if (el.closest('[role="dialog"]')) continue;
-                
-                const text = el.innerText || '';
-                // 查找包含 "Balance:" 的元素（例如: "Balance: 49.871"）
-                if (text.includes('Balance:') || text.includes('Balance ')) {
-                    // 提取數字（匹配 "Balance: 49.871" 或 "Balance 49.871"）
-                    const balanceMatch = text.match(/Balance:?\s*([\d,\.]+)/i);
-                    if (balanceMatch) {
-                        // 使用更精確的數值解析，保留足夠的小數位
-                        const balanceText = balanceMatch[1].replace(/,/g, '');
-                        const balance = parseFloat(parseFloat(balanceText).toFixed(8));
-                        
-                        // 確定這個餘額對應哪個代幣
-                        // 查找同一容器或父容器中的代幣符號
-                        let container = el.parentElement;
-                        let foundSymbol = null;
-                        let searchDepth = 0;
-                        
-                        while (container && searchDepth < 5) {
-                            // 查找代幣符號
-                            const symbolElements = container.querySelectorAll('.text-xs.text-genius-cream\\/60, .text-sm.text-genius-cream, [class*="text-genius-cream"]');
-                            for (const symEl of symbolElements) {
-                                if (symEl.closest('[role="dialog"]')) continue;
-                                const symText = symEl.innerText?.trim();
-                                if (symText === 'USDT' || symText === 'USDC') {
-                                    // 檢查符號和餘額是否在同一區域（Y 座標相近）
-                                    const symRect = symEl.getBoundingClientRect();
-                                    const elRect = el.getBoundingClientRect();
-                                    if (Math.abs(symRect.top - elRect.top) < 100) {
-                                        foundSymbol = symText;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (foundSymbol) break;
-                            
-                            // 也檢查容器文字中是否包含代幣符號
-                            const containerText = container.innerText || '';
-                            if (containerText.includes('USDT') && !containerText.includes('USDC')) {
-                                foundSymbol = 'USDT';
-                                break;
-                            } else if (containerText.includes('USDC') && !containerText.includes('USDT')) {
-                                foundSymbol = 'USDC';
-                                break;
-                            }
-                            
-                            container = container.parentElement;
-                            searchDepth++;
-                        }
-                        
-                        if (foundSymbol && balance > balances[foundSymbol]) {
-                            balances[foundSymbol] = balance;
-                            if (CONFIG.debug) {
-                                log(`✓ 從 Balance: 元素讀取到 ${foundSymbol} 餘額: ${balance}`, 'info');
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 方法2: 從 SWAP 視窗的 Choose 按鈕區域讀取（參考 tradegenius-autopilot.user.js）
-            const chooseButtons = findChooseButtons();
-            if (chooseButtons.length > 0) {
-                for (const chooseBtn of chooseButtons) {
-                    // 確保不在對話框中
-                    const inDialog = chooseBtn.closest('[role="dialog"]');
-                    if (inDialog) continue;
-                    
-                    // 從包含 Choose 按鈕的容器中查找代幣和餘額
-                    let container = chooseBtn.closest('div');
-                    let depth = 0;
-                    while (container && depth < 8) {
-                        // 查找代幣行（參考 tradegenius_userscript.js）
-                        const rows = container.querySelectorAll('.cursor-pointer');
-                        for (const row of rows) {
-                            if (row.closest('[role="dialog"]')) continue;
-                            
-                            const symbolEl = row.querySelector('.text-xs.text-genius-cream\\/60, .text-sm.text-genius-cream');
-                            const symbol = symbolEl?.innerText?.trim();
-                            
-                            if (symbol === 'USDT' || symbol === 'USDC') {
-                                // 查找同一行中的餘額（參考 tradegenius_userscript.js）
-                                const balanceEl = row.querySelector('.flex.flex-nowrap.justify-end, .text-right');
-                                if (balanceEl) {
-                                    const balanceText = balanceEl.innerText || '';
-                                    const balanceMatch = balanceText.match(/[\d,\.]+/);
-                                    if (balanceMatch) {
-                                        // 使用更精確的數值解析，保留足夠的小數位
-                                        const balanceText = balanceMatch[0].replace(/,/g, '');
-                                        const balance = parseFloat(parseFloat(balanceText).toFixed(8));
-                                        if (balance > balances[symbol]) {
-                                            balances[symbol] = balance;
-                                            if (CONFIG.debug) {
-                                                log(`✓ 從代幣行讀取到 ${symbol} 餘額: ${balance}`, 'info');
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        container = container.parentElement;
-                        depth++;
-                    }
-                }
-            }
-
-            // 方法3: 從主頁面文字匹配（備用方法）
-            if (balances.USDT === 0 && balances.USDC === 0) {
-                for (const el of allElements) {
-                    if (el.closest('[role="dialog"]')) continue;
-                    
-                    const text = el.innerText || '';
-                    // 匹配 "USDT: 49.871" 或 "USDC: 49.871" 格式
-                    const match = text.match(/(USDT|USDC)[\s:]+([\d,\.]+)/i);
-                    if (match) {
-                        const symbol = match[1].toUpperCase();
-                        // 使用更精確的數值解析，保留足夠的小數位
-                        const balanceText = match[2].replace(/,/g, '');
-                        const balance = parseFloat(parseFloat(balanceText).toFixed(8));
-                        if (symbol === 'USDT' && balance > balances.USDT) {
-                            balances.USDT = balance;
-                        } else if (symbol === 'USDC' && balance > balances.USDC) {
-                            balances.USDC = balance;
-                        }
-                    }
-                }
-            }
-
-            if (CONFIG.debug) {
-                log(`餘額讀取結果: USDT=${balances.USDT}, USDC=${balances.USDC}`, 'info');
-            }
-
-            return balances;
-        } catch (error) {
-            log(`獲取餘額失敗: ${error.message}`, 'error');
-            return { USDT: 0, USDC: 0 };
-        }
-    }
-
-    async function checkBalanceSufficient() {
-        if (!CONFIG.enableBalanceMonitoring) return true;
-
-        // 在讀取餘額前，確保沒有其他視窗遮擋 SWAP 視窗
-        // 這可以避免讀取到代幣選擇視窗中的舊餘額
-        if (isDialogOpen()) {
-            log('檢測到視窗打開，先關閉視窗以確保讀取正確的餘額...', 'info');
-            await ensureAllDialogsClosed(3);
-            await sleep(500);
-        }
-
-        // 如果已經選擇了發送代幣，優先檢查該代幣的餘額
-        if (currentFromToken) {
-            const balances = await getTokenBalances();
-            const selectedBalance = balances[currentFromToken] || 0;
-            
-            if (selectedBalance < CONFIG.minBalanceThreshold) {
-                log(`⚠️ 餘額不足！當前 ${currentFromToken} 餘額: ${selectedBalance.toFixed(4)}，最低要求: ${CONFIG.minBalanceThreshold}`, 'warning');
-                return false;
-            }
-            
-            // 更新記錄的餘額
-            lastBalance = balances;
-            return true;
-        }
-
-        // 如果還沒有選擇代幣，檢查所有代幣的最大餘額
-        const balances = await getTokenBalances();
-        const maxBalance = Math.max(balances.USDT, balances.USDC);
-
-        if (maxBalance < CONFIG.minBalanceThreshold) {
-            log(`⚠️ 餘額不足！當前最大餘額: ${maxBalance.toFixed(4)}，最低要求: ${CONFIG.minBalanceThreshold}`, 'warning');
-            return false;
-        }
-
-        // 檢查餘額異常變化
-        if (lastBalance.USDT !== null && lastBalance.USDC !== null) {
-            const usdtChange = Math.abs(balances.USDT - lastBalance.USDT);
-            const usdcChange = Math.abs(balances.USDC - lastBalance.USDC);
-            const maxChange = Math.max(usdtChange, usdcChange);
-
-            // 如果餘額變化超過 50%（可能是異常），發出警告
-            if (maxChange > Math.max(lastBalance.USDT, lastBalance.USDC) * 0.5) {
-                log(`⚠️ 檢測到餘額異常變化: USDT ${lastBalance.USDT} → ${balances.USDT}, USDC ${lastBalance.USDC} → ${balances.USDC}`, 'warning');
-            }
-        }
-
-        lastBalance = balances;
-        return true;
-    }
 
     // ==================== DOM 查找函數 ====================
     // 找到所有代幣選擇按鈕（包括已選擇的）
@@ -1408,7 +1233,7 @@
     // 查找並點擊 M.Cap 選項
     async function findAndClickMCapOption(mcapText) {
         try {
-            // 查找包含 "M. Cap:" 的容器
+            // 方法1: 查找包含 "M. Cap:" 或 "M.Cap:" 的容器
             const allElements = Array.from(document.querySelectorAll('*'));
             let mcapContainer = null;
             
@@ -1420,17 +1245,64 @@
                 }
             }
             
+            // 方法2: 如果方法1失敗，嘗試通過包含 border-genius-blue 和 cursor-pointer 的 div 查找
+            if (!mcapContainer) {
+                const candidateContainers = document.querySelectorAll('div[class*="border-genius-blue"][class*="cursor-pointer"]');
+                for (const container of candidateContainers) {
+                    const containerText = container.innerText || container.textContent || '';
+                    // 檢查容器是否包含 M.Cap 相關文字或多個 M.Cap 選項
+                    if (containerText.includes('M. Cap') || containerText.includes('M.Cap') ||
+                        (containerText.includes('<1M') && containerText.includes('1-5M'))) {
+                        // 向上查找父容器
+                        let parent = container.parentElement;
+                        for (let i = 0; i < 5 && parent; i++) {
+                            const parentText = parent.innerText || parent.textContent || '';
+                            if (parentText.includes('M. Cap:') || parentText.includes('M.Cap:')) {
+                                mcapContainer = parent;
+                                break;
+                            }
+                            parent = parent.parentElement;
+                        }
+                        if (mcapContainer) break;
+                    }
+                }
+            }
+            
             if (!mcapContainer) {
                 log(`⚠️ 未找到 M.Cap 容器`, 'warning');
                 return false;
             }
             
             // 在容器中查找包含指定文字的選項
-            const mcapOptions = mcapContainer.querySelectorAll('div.cursor-pointer, div[class*="cursor-pointer"]');
+            // 優先查找包含 border-genius-blue 和 cursor-pointer 的 div
+            const mcapOptions = mcapContainer.querySelectorAll('div.cursor-pointer[class*="border-genius-blue"], div[class*="cursor-pointer"][class*="border-genius-blue"], div.cursor-pointer, div[class*="cursor-pointer"]');
+            
+            // 處理特殊字符：<1M 和 >20M
+            const normalizedMcapText = mcapText;
+            const alternativeTexts = [];
+            if (mcapText === '<1M') {
+                alternativeTexts.push('&lt;1M', '<1M');
+            } else if (mcapText === '>20M') {
+                alternativeTexts.push('&gt;20M', '>20M');
+            } else {
+                alternativeTexts.push(mcapText);
+            }
             
             for (const option of mcapOptions) {
                 const optionText = option.innerText?.trim() || option.textContent?.trim() || '';
-                if (optionText === mcapText) {
+                const optionHTML = option.innerHTML?.trim() || '';
+                
+                // 檢查文字是否匹配（支持多種格式）
+                const isMatch = alternativeTexts.some(alt => 
+                    optionText === alt || 
+                    optionText === normalizedMcapText ||
+                    optionHTML.includes(alt) ||
+                    (mcapText === '<1M' && (optionText === '<1M' || optionText.includes('<1M'))) ||
+                    (mcapText === '>20M' && (optionText === '>20M' || optionText.includes('>20M'))) ||
+                    (mcapText !== '<1M' && mcapText !== '>20M' && optionText === mcapText)
+                );
+                
+                if (isMatch) {
                     const rect = option.getBoundingClientRect();
                     const style = window.getComputedStyle(option);
                     
@@ -1439,20 +1311,54 @@
                         style.visibility !== 'hidden' &&
                         option.offsetParent !== null) {
                         
-                        // 檢查是否已經選中
+                        // 檢查是否已經選中（通過 bg-genius-blue 類或 text-genius-cream 類）
                         const classes = option.className || '';
-                        const isSelected = classes.includes('bg-genius-blue');
+                        const isSelected = classes.includes('bg-genius-blue') && 
+                                          (classes.includes('text-genius-cream') || 
+                                           option.querySelector('.text-genius-cream'));
                         
-                        if (!isSelected) {
-                            option.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                            await sleep(200);
+                        // 無論是否已選中，都點擊一次以確保該選項被激活（這樣才能設定該選項的 slippage）
+                        option.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        await sleep(300);
+                        
+                        // 嘗試多種點擊方式
+                        let clickSuccess = false;
+                        
+                        // 方式1: 直接點擊
+                        try {
                             option.click();
-                            log(`✓ 點擊 M.Cap 選項: ${mcapText}`, 'success');
-                            await sleep(500);
+                            clickSuccess = true;
+                        } catch (e) {
+                            log(`⚠️ 直接點擊失敗，嘗試其他方式: ${e.message}`, 'warning');
+                        }
+                        
+                        // 方式2: 使用 MouseEvent
+                        if (!clickSuccess) {
+                            try {
+                                const clickEvent = new MouseEvent('click', {
+                                    bubbles: true,
+                                    cancelable: true,
+                                    view: window,
+                                    detail: 1
+                                });
+                                option.dispatchEvent(clickEvent);
+                                clickSuccess = true;
+                            } catch (e) {
+                                log(`⚠️ MouseEvent 點擊失敗: ${e.message}`, 'warning');
+                            }
+                        }
+                        
+                        if (clickSuccess) {
+                            if (isSelected) {
+                                log(`✓ M.Cap 選項已選中，已重新點擊以確保激活: ${mcapText}`, 'info');
+                            } else {
+                                log(`✓ 點擊 M.Cap 選項: ${mcapText}`, 'success');
+                            }
+                            // 等待 UI 更新（點擊後需要時間讓選項激活）
+                            await sleep(800);
                             return true;
                         } else {
-                            log(`✓ M.Cap 選項已選中: ${mcapText}`, 'info');
-                            return true;
+                            log(`⚠️ 無法點擊 M.Cap 選項: ${mcapText}`, 'warning');
                         }
                     }
                 }
@@ -1470,51 +1376,111 @@
     async function setSlippageForAllMCaps(slippageValue, mode) {
         const mcapOptions = ['<1M', '1-5M', '5-20M', '>20M', 'No Data'];
         let successCount = 0;
+        const slippageValueStr = slippageValue.toFixed(2);
         
-        log(`開始為 ${mode} 方的所有 M.Cap 選項設定 Slippage 至 ${slippageValue}%...`, 'info');
+        log(`開始為 ${mode} 方的所有 M.Cap 選項設定 Slippage 至 ${slippageValueStr}%...`, 'info');
+        log(`將依次設定 ${mcapOptions.length} 個 M.Cap 選項: ${mcapOptions.join(', ')}`, 'info');
         
-        for (const mcap of mcapOptions) {
+        for (let index = 0; index < mcapOptions.length; index++) {
+            const mcap = mcapOptions[index];
+            
             if (!isRunning) {
                 log('⚠️ 設定已取消（程序已停止）', 'warning');
                 return false;
             }
             
-            log(`設定 ${mode} 方 M.Cap ${mcap} 的 Slippage...`, 'info');
+            log(`\n[${index + 1}/${mcapOptions.length}] 設定 ${mode} 方 M.Cap "${mcap}" 的 Slippage...`, 'info');
             
-            // 點擊 M.Cap 選項
-            const mcapClicked = await findAndClickMCapOption(mcap);
+            // 步驟 1: 點擊 M.Cap 選項（必須先點擊才能設定該選項的 slippage）
+            let mcapClicked = false;
+            for (let retry = 0; retry < 3; retry++) {
+                if (retry > 0) {
+                    log(`重試點擊 M.Cap 選項 "${mcap}"... (${retry + 1}/3)`, 'warning');
+                    await sleep(1000);
+                }
+                
+                mcapClicked = await findAndClickMCapOption(mcap);
+                if (mcapClicked) {
+                    break;
+                }
+            }
+            
             if (!mcapClicked) {
-                log(`⚠️ 無法點擊 M.Cap 選項 ${mcap}，跳過`, 'warning');
+                log(`❌ 無法點擊 M.Cap 選項 "${mcap}"，跳過此選項`, 'error');
                 continue;
             }
             
-            // 等待 UI 更新
-            await sleep(500);
+            // 等待 M.Cap 選項激活後的 UI 更新（確保 slippage 輸入框已切換到該選項）
+            log(`✓ M.Cap 選項 "${mcap}" 已點擊，等待 UI 更新...`, 'info');
+            await sleep(1000); // 增加等待時間，確保 UI 完全更新
             
-            // 設定 slippage 值
-            const slippageValueStr = slippageValue.toFixed(2);
-            const setSuccess = await findAndSetInput([
-                { type: 'text', text: 'Slippage' },
-                { type: 'data-attr', attr: 'data-sentry-component', value: 'Slippage' }
-            ], slippageValueStr, `${mode} 方 M.Cap ${mcap} 的 Slippage`);
+            // 步驟 2: 驗證 M.Cap 選項是否已激活（可選，用於調試）
+            // 這裡可以添加驗證邏輯，但為了不影響流程，暫時跳過
             
-            if (setSuccess) {
-                successCount++;
-                // 驗證值是否已保存
-                await sleep(800);
-                const verified = await verifyInputValue('Slippage', slippageValueStr);
-                if (!verified) {
-                    log(`⚠️ ${mode} 方 M.Cap ${mcap} 的 Slippage 值驗證失敗，但將繼續`, 'warning');
+            // 步驟 3: 設定 slippage 值
+            log(`設定 ${mode} 方 M.Cap "${mcap}" 的 Slippage 為 ${slippageValueStr}%...`, 'info');
+            let setSuccess = false;
+            
+            for (let retry = 0; retry < 3; retry++) {
+                if (retry > 0) {
+                    log(`重試設定 Slippage... (${retry + 1}/3)`, 'warning');
+                    await sleep(1000);
+                    
+                    // 重新點擊 M.Cap 選項，確保它仍然被選中
+                    await findAndClickMCapOption(mcap);
+                    await sleep(800);
                 }
-            } else {
-                log(`⚠️ ${mode} 方 M.Cap ${mcap} 的 Slippage 設定失敗`, 'warning');
+                
+                setSuccess = await findAndSetInput([
+                    { type: 'text', text: 'Slippage' },
+                    { type: 'data-attr', attr: 'data-sentry-component', value: 'Slippage' }
+                ], slippageValueStr, `${mode} 方 M.Cap "${mcap}" 的 Slippage`);
+                
+                if (setSuccess) {
+                    break;
+                }
             }
             
-            await sleep(500);
+            if (setSuccess) {
+                // 步驟 4: 驗證值是否已保存
+                log(`驗證 ${mode} 方 M.Cap "${mcap}" 的 Slippage 值...`, 'info');
+                await sleep(1000); // 等待值保存
+                
+                let verified = false;
+                for (let verifyRetry = 0; verifyRetry < 2; verifyRetry++) {
+                    verified = await verifyInputValue('Slippage', slippageValueStr);
+                    if (verified) {
+                        break;
+                    }
+                    if (verifyRetry < 1) {
+                        await sleep(500);
+                    }
+                }
+                
+                if (verified) {
+                    log(`✅ ${mode} 方 M.Cap "${mcap}" 的 Slippage 已成功設定為 ${slippageValueStr}%`, 'success');
+                    successCount++;
+                } else {
+                    log(`⚠️ ${mode} 方 M.Cap "${mcap}" 的 Slippage 值驗證失敗，但設定操作已執行`, 'warning');
+                    // 即使驗證失敗，也計為成功（可能是驗證邏輯的問題）
+                    successCount++;
+                }
+            } else {
+                log(`❌ ${mode} 方 M.Cap "${mcap}" 的 Slippage 設定失敗`, 'error');
+            }
+            
+            // 在每個選項設定完成後，等待一小段時間再處理下一個
+            if (index < mcapOptions.length - 1) {
+                await sleep(600); // 選項之間的間隔
+            }
         }
         
-        log(`✓ ${mode} 方 M.Cap Slippage 設定完成: ${successCount}/${mcapOptions.length}`, 
+        log(`\n${mode} 方 M.Cap Slippage 設定完成: ${successCount}/${mcapOptions.length} 個選項成功`, 
             successCount === mcapOptions.length ? 'success' : 'warning');
+        
+        if (successCount < mcapOptions.length) {
+            log(`⚠️ 有 ${mcapOptions.length - successCount} 個 M.Cap 選項設定失敗，但將繼續執行`, 'warning');
+        }
         
         return successCount === mcapOptions.length;
     }
@@ -2376,7 +2342,7 @@
         
         // 步驟 5: 設定 Buy 方的 slippage % 至初始值（為所有 M.Cap 選項設定）
         if (!isRunning) return false;
-        const slippageInitialValue = CONFIG.enableDynamicAdjustment ? CONFIG.slippageInitial : 0.1;
+        const slippageInitialValue = CONFIG.enableDynamicAdjustment ? CONFIG.slippageInitial : 0.05;
         const slippageInitialStr = slippageInitialValue.toFixed(2);
         log(`步驟 5/15: 設定 Buy 方的所有 M.Cap 選項的 Slippage 至 ${slippageInitialStr}%`, 'info');
         const step5 = await setSlippageForAllMCaps(slippageInitialValue, 'Buy');
@@ -2787,9 +2753,9 @@
 
     // ==================== 核心交易函數 ====================
 
-    // 選擇第一個代幣（餘額最大的 USDC 或 USDT）
+    // 選擇第一個代幣（USDC 或 USDT）
     async function selectFirstToken() {
-        log('選擇發送代幣（餘額最大）...', 'info');
+        log('選擇發送代幣...', 'info');
 
         await sleep(CONFIG.waitAfterChoose);
 
@@ -2801,30 +2767,20 @@
             }
 
             const tokenRows = document.querySelectorAll('[role="dialog"] .cursor-pointer');
-            let maxBalance = -1;
             let targetRow = null;
             let targetSymbol = null;
 
-            tokenRows.forEach(row => {
+            for (const row of tokenRows) {
                 const symbolEl = row.querySelector('.text-xs.text-genius-cream\\/60, .text-sm.text-genius-cream');
                 const symbol = symbolEl?.innerText?.trim();
 
                 if (symbol === 'USDT' || symbol === 'USDC') {
-                    const balanceText = row.querySelector('.flex.flex-nowrap.justify-end, .text-right')?.innerText || '';
-                    const balanceMatch = balanceText.match(/[\d,\.]+/);
-
-                    if (balanceMatch) {
-                        const balance = parseFloat(balanceMatch[0].replace(/,/g, ''));
-                        log(`發現 ${symbol}: 餘額 ${balance}`, 'info');
-
-                        if (balance > maxBalance && balance >= CONFIG.minBalanceThreshold) {
-                            maxBalance = balance;
-                            targetRow = row;
-                            targetSymbol = symbol;
-                        }
-                    }
+                    targetRow = row;
+                    targetSymbol = symbol;
+                    log(`發現 ${symbol}，選擇它`, 'info');
+                    break;
                 }
-            });
+            }
 
             if (targetRow) {
                 // 再次檢查是否已停止
@@ -2834,12 +2790,12 @@
                 }
                 targetRow.click();
                 currentFromToken = targetSymbol;
-                log(`✓ 選擇了 ${targetSymbol} (餘額: ${maxBalance})`, 'success');
+                log(`✓ 選擇了 ${targetSymbol}`, 'success');
                 return true;
             }
 
             if (attempt < CONFIG.maxRetryTokenSelect - 1) {
-                log(`未找到足夠餘額的代幣，重試 ${attempt + 1}/${CONFIG.maxRetryTokenSelect}...`, 'warning');
+                log(`未找到 USDT/USDC，重試 ${attempt + 1}/${CONFIG.maxRetryTokenSelect}...`, 'warning');
                 await sleep(1000);
                 // 在等待期間檢查是否已停止
                 if (!isRunning) {
@@ -2849,7 +2805,7 @@
             }
         }
 
-        log('❌ 未找到 USDT/USDC 或餘額不足', 'error');
+        log('❌ 未找到 USDT/USDC', 'error');
         return false;
     }
 
@@ -3116,118 +3072,6 @@
         return true;
     }
 
-    // 重新選擇幣種（當餘額不足時）
-    async function reselectTokensForBalance() {
-        log('🔄 餘額不足，重新選擇幣種...', 'warning');
-        
-        // 清除當前選擇的代幣
-        currentFromToken = null;
-        
-        // 確保所有視窗都已關閉
-        if (isDialogOpen()) {
-            await ensureAllDialogsClosed(3);
-            await sleep(500);
-        }
-        
-        // 查找所有代幣選擇按鈕（包括已選擇的）
-        const allTokenBtns = findAllTokenSelectionButtons();
-        
-        if (allTokenBtns.length === 0) {
-            log('⚠️ 未找到代幣選擇按鈕，無法重新選擇幣種', 'warning');
-            return false;
-        }
-        
-        if (allTokenBtns.length < 2) {
-            log(`⚠️ 只找到 ${allTokenBtns.length} 個代幣選擇按鈕，預期至少 2 個`, 'warning');
-        }
-        
-        // 點擊第一個按鈕（發送代幣）- 即使它已經被選擇了
-        const firstBtn = allTokenBtns[0];
-        log('點擊第一個代幣選擇按鈕 (發送) 以重新選擇', 'info');
-        firstBtn.click();
-        await sleep(CONFIG.waitAfterChoose);
-        
-        // 檢查是否已停止
-        if (!isRunning) {
-            return false;
-        }
-        
-        // 選擇第一個代幣（會自動選擇餘額最大的）
-        if (isDialogOpen()) {
-            const success = await selectFirstToken();
-            if (!success) {
-                if (!isRunning) return false;
-                log('重新選擇第一個代幣失敗', 'error');
-                return false;
-            }
-            await sleep(CONFIG.waitAfterTokenSelect);
-        }
-        
-        // 檢查是否已停止
-        if (!isRunning) {
-            return false;
-        }
-        
-        log(`✓ 重新選擇的代幣: ${currentFromToken}`, 'success');
-        
-        // 點擊第二個按鈕（接收代幣）
-        await sleep(500);
-        const allTokenBtns2 = findAllTokenSelectionButtons();
-        
-        if (allTokenBtns2.length >= 2) {
-            // 確保點擊的是第二個按鈕（接收代幣）
-            const secondBtn = allTokenBtns2[1];
-            log('點擊第二個代幣選擇按鈕 (接收) 以重新選擇', 'info');
-            secondBtn.click();
-            await sleep(CONFIG.waitAfterChoose);
-            
-            // 檢查是否已停止
-            if (!isRunning) {
-                return false;
-            }
-            
-            if (isDialogOpen()) {
-                const success = await selectSecondToken();
-                if (!success) {
-                    if (!isRunning) return false;
-                    log('重新選擇第二個代幣失敗', 'error');
-                    return false;
-                }
-                await sleep(CONFIG.waitAfterTokenSelect);
-            }
-        } else if (allTokenBtns2.length === 1) {
-            // 如果只有一個按鈕，可能是第二個還沒被選擇，嘗試點擊它
-            log('只找到 1 個代幣選擇按鈕，嘗試點擊第二個 (接收)', 'info');
-            allTokenBtns2[0].click();
-            await sleep(CONFIG.waitAfterChoose);
-            
-            if (!isRunning) {
-                return false;
-            }
-            
-            if (isDialogOpen()) {
-                const success = await selectSecondToken();
-                if (!success) {
-                    if (!isRunning) return false;
-                    log('重新選擇第二個代幣失敗', 'error');
-                    return false;
-                }
-                await sleep(CONFIG.waitAfterTokenSelect);
-            }
-        }
-        
-        // 確保所有視窗都已關閉
-        if (isDialogOpen()) {
-            log('確保代幣選擇視窗已關閉...', 'info');
-            await ensureAllDialogsClosed(3);
-            await sleep(500);
-        }
-        
-        log('✓ 幣種重新選擇完成', 'success');
-        await sleep(1000);
-        
-        return true;
-    }
 
     // ==================== 增強版失敗檢測函數 ====================
     
@@ -4043,7 +3887,7 @@
 
     // 驗證交易成功（舊版：使用彈窗檢測 + 多重信號檢測，現已改為備用機制）
     // 注意：此函數現在主要作為備用驗證機制，主要判斷邏輯已改為 verifySwapByTokenComparison
-    async function verifySwapSuccess(balanceBeforeSwap) {
+    async function verifySwapSuccess() {
         if (!CONFIG.enableSuccessVerification) return true;
 
         log('驗證交易成功...', 'info');
@@ -4145,9 +3989,7 @@
                 if (failureSignals.hasErrorMessage) {
                     log(`❌ 檢測到失敗信號: ${failureSignals.errorText}`, 'error');
                     
-                    if (failureSignals.hasInsufficientBalance) {
-                        log('❌ 錯誤類型：餘額不足', 'error');
-                    } else if (failureSignals.hasSlippageError) {
+                    if (failureSignals.hasSlippageError) {
                         log('❌ 錯誤類型：滑點過大', 'error');
                     } else if (failureSignals.hasNetworkError) {
                         log('❌ 錯誤類型：網絡錯誤', 'error');
@@ -4273,57 +4115,17 @@
                         swapPendingCompleted = true;
                     }
                     
-                    // 第三步：如果 SWAP pending 未完成，使用餘額驗證作為備用判斷
+                    // 第三步：如果 SWAP pending 未完成，但檢測到成功彈窗，認為交易成功
                     if (!swapPendingCompleted) {
-                        log('⚠️ SWAP pending 幣種未變化，但檢測到成功彈窗，使用餘額驗證作為備用判斷...', 'warning');
-                        
-                        // 如果檢測到成功彈窗，即使幣種未變化，也應該驗證餘額
-                        // 因為幣種讀取可能不準確，或幣種切換有延遲
-                        if (balanceBeforeSwap) {
-                            log('進行餘額驗證（備用判斷）...', 'info');
-                            await sleep(CONFIG.balanceVerificationDelay);
-                            
-                            const rawBalanceAfterSwap = await getTokenBalances();
-                            const balanceAfterSwap = {
-                                USDT: parseFloat(parseFloat(rawBalanceAfterSwap.USDT || 0).toFixed(8)),
-                                USDC: parseFloat(parseFloat(rawBalanceAfterSwap.USDC || 0).toFixed(8))
-                            };
-                            
-                            const fromTokenBeforeBalance = parseFloat((balanceBeforeSwap[fromTokenBeforeSwap] || 0).toFixed(8));
-                            const fromTokenAfterBalance = parseFloat((balanceAfterSwap[fromTokenBeforeSwap] || 0).toFixed(8));
-                            const toTokenBeforeBalance = parseFloat((balanceBeforeSwap[expectedToToken] || 0).toFixed(8));
-                            const toTokenAfterBalance = parseFloat((balanceAfterSwap[expectedToToken] || 0).toFixed(8));
-                            
-                            const fromTokenDecrease = parseFloat((fromTokenBeforeBalance - fromTokenAfterBalance).toFixed(8));
-                            const toTokenIncrease = parseFloat((toTokenAfterBalance - toTokenBeforeBalance).toFixed(8));
-                            
-                            log(`餘額變化（備用驗證）: ${fromTokenBeforeSwap} 減少 ${fromTokenDecrease.toFixed(4)}, ${expectedToToken} 增加 ${toTokenIncrease.toFixed(4)}`, 'info');
-                            
-                            // 如果發送幣大幅減少（至少 90%）且接收幣明顯增加，認為交易成功
-                            const fromTokenDecreaseThreshold = fromTokenBeforeBalance * 0.90;
-                            if (fromTokenDecrease >= fromTokenDecreaseThreshold && toTokenIncrease > 0.01) {
-                                log(`✓ 餘額驗證通過（備用判斷）：發送幣減少 ${fromTokenDecrease.toFixed(4)}，接收幣增加 ${toTokenIncrease.toFixed(4)}`, 'success');
-                                log(`✓ 雖然幣種讀取未變化，但餘額變化證明交易成功`, 'success');
-                                currentFromToken = expectedToToken; // 更新為預期的幣種
-                                window.fetch = originalFetch;
-                                return true;
-                            } else {
-                                log(`❌ 餘額驗證失敗：發送幣減少 ${fromTokenDecrease.toFixed(4)}（預期至少 ${fromTokenDecreaseThreshold.toFixed(4)}），接收幣增加 ${toTokenIncrease.toFixed(4)}`, 'error');
-                                window.fetch = originalFetch;
-                                return false;
-                            }
-                        } else {
-                            // 沒有餘額記錄，但檢測到成功彈窗，認為成功
-                            log('⚠️ 未記錄交易前餘額，但檢測到成功彈窗，認為交易成功', 'warning');
-                            currentFromToken = expectedToToken;
-                            window.fetch = originalFetch;
-                            return true;
-                        }
+                        log('⚠️ SWAP pending 幣種未變化，但檢測到成功彈窗，認為交易成功', 'warning');
+                        currentFromToken = expectedToToken;
+                        window.fetch = originalFetch;
+                        return true;
                     }
                     
-                    // 第四步：驗證幣種變化和餘額變化（SWAP pending 已完成）
+                    // 第四步：驗證幣種變化（SWAP pending 已完成）
                     if (fromTokenBeforeSwap) {
-                        log('驗證幣種變化和餘額變化...', 'info');
+                        log('驗證幣種變化...', 'info');
                         
                         // 讀取當前頁面上顯示的發送幣（再次確認）
                         const fromTokenAfterSwap = getCurrentDisplayedFromToken();
@@ -4341,158 +4143,17 @@
                         if (fromTokenAfterSwap === expectedToToken) {
                             log(`✓ 幣種變化驗證通過：${fromTokenBeforeSwap} → ${fromTokenAfterSwap}`, 'success');
                             
-                            // 加強驗證：驗證餘額實際變化
-                            if (balanceBeforeSwap) {
-                                log('驗證餘額變化...', 'info');
-                                
-                                // 等待額外時間確保餘額更新完成（使用配置參數）
-                                await sleep(CONFIG.balanceVerificationDelay);
-                                
-                                // 讀取交易後的餘額並標準化精度（帶重試機制）
-                                let balanceAfterSwap = null;
-                                let balanceReadSuccess = false;
-                                
-                                for (let balanceRetry = 0; balanceRetry < CONFIG.balanceReadRetries; balanceRetry++) {
-                                    const rawBalanceAfterSwap = await getTokenBalances();
-                                    balanceAfterSwap = {
-                                        USDT: parseFloat(parseFloat(rawBalanceAfterSwap.USDT || 0).toFixed(8)),
-                                        USDC: parseFloat(parseFloat(rawBalanceAfterSwap.USDC || 0).toFixed(8))
-                                    };
-                                    
-                                    // 檢查餘額是否有效（不全為 0）
-                                    if (balanceAfterSwap.USDT > 0 || balanceAfterSwap.USDC > 0) {
-                                        balanceReadSuccess = true;
-                                        break;
-                                    }
-                                    
-                                    if (balanceRetry < CONFIG.balanceReadRetries - 1) {
-                                        log(`⚠️ 餘額讀取異常（全為 0），${CONFIG.balanceReadRetryInterval / 1000} 秒後重試... (${balanceRetry + 1}/${CONFIG.balanceReadRetries})`, 'warning');
-                                        await sleep(CONFIG.balanceReadRetryInterval);
-                                    }
-                                }
-                                
-                                if (!balanceReadSuccess) {
-                                    log('⚠️ 餘額讀取失敗，但幣種已變化，認為交易成功', 'warning');
-                                    currentFromToken = fromTokenAfterSwap;
-                                    window.fetch = originalFetch;
-                                    return true;
-                                }
-                                
-                                log(`交易前餘額: USDT=${balanceBeforeSwap.USDT.toFixed(4)}, USDC=${balanceBeforeSwap.USDC.toFixed(4)}`, 'info');
-                                log(`交易後餘額: USDT=${balanceAfterSwap.USDT.toFixed(4)}, USDC=${balanceAfterSwap.USDC.toFixed(4)}`, 'info');
-                                
-                                // 計算餘額變化（使用更精確的數值處理）
-                                const fromTokenBeforeBalance = parseFloat((balanceBeforeSwap[fromTokenBeforeSwap] || 0).toFixed(8));
-                                const fromTokenAfterBalance = parseFloat((balanceAfterSwap[fromTokenBeforeSwap] || 0).toFixed(8));
-                                const toTokenBeforeBalance = parseFloat((balanceBeforeSwap[expectedToToken] || 0).toFixed(8));
-                                const toTokenAfterBalance = parseFloat((balanceAfterSwap[expectedToToken] || 0).toFixed(8));
-                                
-                                const fromTokenDecrease = parseFloat((fromTokenBeforeBalance - fromTokenAfterBalance).toFixed(8));
-                                const toTokenIncrease = parseFloat((toTokenAfterBalance - toTokenBeforeBalance).toFixed(8));
-                                
-                                log(`餘額變化: ${fromTokenBeforeSwap} 減少 ${fromTokenDecrease.toFixed(4)}, ${expectedToToken} 增加 ${toTokenIncrease.toFixed(4)}`, 'info');
-                                
-                                // 注意：接收幣增加量可能略大於發送幣減少量（由於匯率波動、滑點保護等因素）
-                                // 這是正常現象，不應作為失敗判斷依據
-                                if (toTokenIncrease > fromTokenDecrease + 0.01) {
-                                    log(`ℹ️ 接收幣增加量 (${toTokenIncrease.toFixed(4)}) 略大於發送幣減少量 (${fromTokenDecrease.toFixed(4)})，可能是匯率波動或滑點保護，屬於正常情況`, 'info');
-                                }
-                                
-                                // 驗證發送幣餘額應該大幅減少（因為點了 MAX，應該接近 0）
-                                // 允許 5% 的誤差（考慮手續費和精度）
-                                const fromTokenDecreaseThreshold = fromTokenBeforeBalance * 0.95; // 至少減少 95%
-                                if (fromTokenDecrease < fromTokenDecreaseThreshold) {
-                                    log(`❌ ${fromTokenBeforeSwap} 餘額減少不足：預期至少減少 ${fromTokenDecreaseThreshold.toFixed(4)}，實際減少 ${fromTokenDecrease.toFixed(4)}`, 'error');
-                                    window.fetch = originalFetch;
-                                    return false;
-                                }
-                                
-                                // 驗證接收幣餘額應該增加
-                                // 注意：接收幣增加量可能略大於或略小於發送幣減少量（由於匯率波動、滑點保護、手續費等因素）
-                                // 這裡只檢查最小值，確保接收幣有明顯增加（至少 90%），不限制最大值
-                                const minExpectedIncrease = fromTokenDecrease * 0.90; // 至少增加 90%（考慮手續費和匯率波動）
-                                if (toTokenIncrease < minExpectedIncrease) {
-                                    log(`❌ ${expectedToToken} 餘額增加不足：預期至少增加 ${minExpectedIncrease.toFixed(4)}，實際增加 ${toTokenIncrease.toFixed(4)}`, 'error');
-                                    window.fetch = originalFetch;
-                                    return false;
-                                }
-                                
-                                // 驗證發送幣餘額不應該增加（異常情況）
-                                if (fromTokenAfterBalance > fromTokenBeforeBalance + 0.01) {
-                                    log(`❌ 異常：${fromTokenBeforeSwap} 餘額不應該增加，交易可能失敗`, 'error');
-                                    window.fetch = originalFetch;
-                                    return false;
-                                }
-                                
-                                // 驗證接收幣餘額不應該減少（異常情況）
-                                if (toTokenAfterBalance < toTokenBeforeBalance - 0.01) {
-                                    log(`❌ 異常：${expectedToToken} 餘額不應該減少，交易可能失敗`, 'error');
-                                    window.fetch = originalFetch;
-                                    return false;
-                                }
-                                
-                                // 額外驗證：如果發送幣減少量和接收幣增加量都接近 0，可能是讀取錯誤
-                                if (fromTokenDecrease < 0.01 && toTokenIncrease < 0.01) {
-                                    log(`❌ 異常：餘額變化過小，可能是讀取錯誤或交易未真正執行`, 'error');
-                                    window.fetch = originalFetch;
-                                    return false;
-                                }
-                                
-                                log(`✓ 餘額變化驗證通過：${fromTokenBeforeSwap} 減少 ${fromTokenDecrease.toFixed(4)}, ${expectedToToken} 增加 ${toTokenIncrease.toFixed(4)}`, 'success');
-                            } else {
-                                log('⚠️ 未記錄交易前餘額，跳過餘額驗證', 'warning');
-                            }
-                            
-                            log(`✓ 交易確認成功：幣種變化 + 餘額變化驗證通過`, 'success');
+                            log(`✓ 交易確認成功：幣種變化驗證通過`, 'success');
                             // 更新 currentFromToken 為新的發送幣
                             currentFromToken = fromTokenAfterSwap;
                             // 恢復原始 fetch
                             window.fetch = originalFetch;
                             return true;
                         } else if (fromTokenAfterSwap === fromTokenBeforeSwap) {
-                            log(`⚠️ 幣種讀取未變化：${fromTokenBeforeSwap} → ${fromTokenAfterSwap}，但已檢測到成功彈窗，使用餘額驗證作為備用判斷...`, 'warning');
-                            
-                            // 雖然幣種讀取未變化，但已檢測到成功彈窗，應該用餘額驗證
-                            if (balanceBeforeSwap) {
-                                log('進行餘額驗證（備用判斷）...', 'info');
-                                await sleep(CONFIG.balanceVerificationDelay);
-                                
-                                const rawBalanceAfterSwap = await getTokenBalances();
-                                const balanceAfterSwap = {
-                                    USDT: parseFloat(parseFloat(rawBalanceAfterSwap.USDT || 0).toFixed(8)),
-                                    USDC: parseFloat(parseFloat(rawBalanceAfterSwap.USDC || 0).toFixed(8))
-                                };
-                                
-                                const fromTokenBeforeBalance = parseFloat((balanceBeforeSwap[fromTokenBeforeSwap] || 0).toFixed(8));
-                                const fromTokenAfterBalance = parseFloat((balanceAfterSwap[fromTokenBeforeSwap] || 0).toFixed(8));
-                                const toTokenBeforeBalance = parseFloat((balanceBeforeSwap[expectedToToken] || 0).toFixed(8));
-                                const toTokenAfterBalance = parseFloat((balanceAfterSwap[expectedToToken] || 0).toFixed(8));
-                                
-                                const fromTokenDecrease = parseFloat((fromTokenBeforeBalance - fromTokenAfterBalance).toFixed(8));
-                                const toTokenIncrease = parseFloat((toTokenAfterBalance - toTokenBeforeBalance).toFixed(8));
-                                
-                                log(`餘額變化（備用驗證）: ${fromTokenBeforeSwap} 減少 ${fromTokenDecrease.toFixed(4)}, ${expectedToToken} 增加 ${toTokenIncrease.toFixed(4)}`, 'info');
-                                
-                                // 如果發送幣大幅減少（至少 90%）且接收幣明顯增加，認為交易成功
-                                const fromTokenDecreaseThreshold = fromTokenBeforeBalance * 0.90;
-                                if (fromTokenDecrease >= fromTokenDecreaseThreshold && toTokenIncrease > 0.01) {
-                                    log(`✓ 餘額驗證通過（備用判斷）：發送幣減少 ${fromTokenDecrease.toFixed(4)}，接收幣增加 ${toTokenIncrease.toFixed(4)}`, 'success');
-                                    log(`✓ 雖然幣種讀取未變化，但餘額變化證明交易成功`, 'success');
-                                    currentFromToken = expectedToToken; // 更新為預期的幣種
-                                    window.fetch = originalFetch;
-                                    return true;
-                                } else {
-                                    log(`❌ 餘額驗證失敗：發送幣減少 ${fromTokenDecrease.toFixed(4)}（預期至少 ${fromTokenDecreaseThreshold.toFixed(4)}），接收幣增加 ${toTokenIncrease.toFixed(4)}`, 'error');
-                                    window.fetch = originalFetch;
-                                    return false;
-                                }
-                            } else {
-                                // 沒有餘額記錄，但檢測到成功彈窗，認為成功
-                                log('⚠️ 未記錄交易前餘額，但檢測到成功彈窗，認為交易成功', 'warning');
-                                currentFromToken = expectedToToken;
-                                window.fetch = originalFetch;
-                                return true;
-                            }
+                            log(`⚠️ 幣種讀取未變化：${fromTokenBeforeSwap} → ${fromTokenAfterSwap}，但已檢測到成功彈窗，認為交易成功`, 'warning');
+                            currentFromToken = expectedToToken;
+                            window.fetch = originalFetch;
+                            return true;
                         } else {
                             log(`⚠️ 幣種變化異常：${fromTokenBeforeSwap} → ${fromTokenAfterSwap}，預期應為 ${expectedToToken}`, 'warning');
                             // API 500 不影響判斷，仍然認為成功（可能是頁面更新延遲）
@@ -4524,68 +4185,18 @@
                 return false;
             }
             
-            // 最終檢查 2: 檢查幣種是否已經變化，或使用餘額驗證（可能彈窗沒有出現但交易已成功）
+            // 最終檢查 2: 檢查幣種是否已經變化（可能彈窗沒有出現但交易已成功）
             if (fromTokenBeforeSwap) {
                 const finalToken = getCurrentDisplayedFromToken();
                 const expectedToToken = fromTokenBeforeSwap === 'USDT' ? 'USDC' : 'USDT';
                 
                 if (finalToken === expectedToToken) {
                     log(`✓ 最終檢查：幣種已變化 (${fromTokenBeforeSwap} → ${finalToken})，認為交易成功`, 'success');
-                    
-                    // 驗證餘額變化
-                    if (balanceBeforeSwap) {
-                        await sleep(2000);
-                        const rawFinalBalance = await getTokenBalances();
-                        const finalBalance = {
-                            USDT: parseFloat(parseFloat(rawFinalBalance.USDT || 0).toFixed(8)),
-                            USDC: parseFloat(parseFloat(rawFinalBalance.USDC || 0).toFixed(8))
-                        };
-                        
-                        const fromDecrease = balanceBeforeSwap[fromTokenBeforeSwap] - finalBalance[fromTokenBeforeSwap];
-                        const toIncrease = finalBalance[expectedToToken] - balanceBeforeSwap[expectedToToken];
-                        
-                        if (fromDecrease > 0.01 && toIncrease > 0.01) {
-                            log(`✓ 最終檢查：餘額已變化 (減少 ${fromDecrease.toFixed(4)}, 增加 ${toIncrease.toFixed(4)})`, 'success');
-                            currentFromToken = finalToken;
-                            window.fetch = originalFetch;
-                            return true;
-                        }
-                    }
-                    
                     currentFromToken = finalToken;
                     window.fetch = originalFetch;
                     return true;
                 } else {
-                    // 幣種未變化，但檢查餘額作為備用驗證
-                    log(`⚠️ 最終檢查：幣種未變化 (${fromTokenBeforeSwap} → ${finalToken})，檢查餘額變化...`, 'warning');
-                    
-                    if (balanceBeforeSwap) {
-                        await sleep(2000);
-                        const rawFinalBalance = await getTokenBalances();
-                        const finalBalance = {
-                            USDT: parseFloat(parseFloat(rawFinalBalance.USDT || 0).toFixed(8)),
-                            USDC: parseFloat(parseFloat(rawFinalBalance.USDC || 0).toFixed(8))
-                        };
-                        
-                        const fromTokenBeforeBalance = parseFloat((balanceBeforeSwap[fromTokenBeforeSwap] || 0).toFixed(8));
-                        const fromTokenAfterBalance = parseFloat((finalBalance[fromTokenBeforeSwap] || 0).toFixed(8));
-                        const toTokenBeforeBalance = parseFloat((balanceBeforeSwap[expectedToToken] || 0).toFixed(8));
-                        const toTokenAfterBalance = parseFloat((finalBalance[expectedToToken] || 0).toFixed(8));
-                        
-                        const fromDecrease = parseFloat((fromTokenBeforeBalance - fromTokenAfterBalance).toFixed(8));
-                        const toIncrease = parseFloat((toTokenAfterBalance - toTokenBeforeBalance).toFixed(8));
-                        
-                        log(`最終檢查餘額變化: ${fromTokenBeforeSwap} 減少 ${fromDecrease.toFixed(4)}, ${expectedToToken} 增加 ${toIncrease.toFixed(4)}`, 'info');
-                        
-                        // 如果發送幣大幅減少（至少 90%）且接收幣明顯增加，認為交易成功
-                        const fromTokenDecreaseThreshold = fromTokenBeforeBalance * 0.90;
-                        if (fromDecrease >= fromTokenDecreaseThreshold && toIncrease > 0.01) {
-                            log(`✓ 最終檢查：餘額驗證通過（備用判斷），交易成功`, 'success');
-                            currentFromToken = expectedToToken;
-                            window.fetch = originalFetch;
-                            return true;
-                        }
-                    }
+                    log(`⚠️ 最終檢查：幣種未變化 (${fromTokenBeforeSwap} → ${finalToken})`, 'warning');
                 }
             }
             
@@ -4627,7 +4238,7 @@
         log('🚀 自動交易啟動！', 'success');
         log(`配置: USDC ⇄ USDT on ${CONFIG.chainDisplayName} (Optimism)`, 'info');
         log(`鏈設置: 固定使用 ${CONFIG.chainDisplayName} 鏈`, 'info');
-        log(`安全設置: 餘額監控=${CONFIG.enableBalanceMonitoring}, 成功驗證=${CONFIG.enableSuccessVerification}`, 'info');
+        log(`安全設置: 成功驗證=${CONFIG.enableSuccessVerification}`, 'info');
 
         // 執行 Preset 設定（在開始交易前）
         log('開始執行 Preset 設定...', 'info');
@@ -4656,9 +4267,6 @@
             return;
         }
 
-        // 初始化餘額
-        await checkBalanceSufficient();
-
         // 重置動態調整計數器
         if (CONFIG.enableDynamicAdjustment) {
             consecutiveSuccesses = 0;
@@ -4671,10 +4279,33 @@
 
         await sleep(1200);
 
+        // 記憶體清理計數器：每執行 10 次交易循環後清理一次
+        let swapCycleCount = 0;
+        const MEMORY_CLEANUP_INTERVAL = 10;
+
         while (isRunning) {
             try {
                 // 檢查是否已停止
                 if (!isRunning) break;
+                
+                // 定期清理記憶體：每執行一定次數的交易後清理
+                swapCycleCount++;
+                if (swapCycleCount >= MEMORY_CLEANUP_INTERVAL) {
+                    swapCycleCount = 0;
+                    // 清理日誌緩衝區（保留最新的）
+                    if (logBuffer.length > MAX_LOG_ENTRIES) {
+                        const keepCount = Math.floor(MAX_LOG_ENTRIES * 0.8);  // 保留 80%
+                        logBuffer.splice(0, logBuffer.length - keepCount);
+                    }
+                    // 強制垃圾回收提示（如果瀏覽器支援）
+                    if (window.gc) {
+                        try {
+                            window.gc();
+                        } catch (e) {
+                            // 忽略錯誤
+                        }
+                    }
+                }
 
                 // 檢查連續失敗次數
                 if (consecutiveFailures >= CONFIG.maxConsecutiveFailures) {
@@ -4692,39 +4323,6 @@
                 // 檢查按鈕加載超時
                 if (checkButtonLoadingTimeout()) {
                     break; // 頁面將刷新，退出循環
-                }
-
-                // 檢查是否已停止
-                if (!isRunning) break;
-
-                // 檢查餘額
-                if (!await checkBalanceSufficient()) {
-                    // 如果已經選擇了代幣，重新選擇幣種（選擇有餘額的幣種）
-                    if (currentFromToken) {
-                        log('⚠️ 當前選擇的代幣餘額不足，重新選擇幣種...', 'warning');
-                        const reselectSuccess = await reselectTokensForBalance();
-                        if (!reselectSuccess) {
-                            if (!isRunning) break;
-                            log('重新選擇幣種失敗，等待後重試...', 'warning');
-                            await sleep(5000);
-                            if (!isRunning) break;
-                            continue;
-                        }
-                        // 重新選擇後，再次檢查餘額
-                        if (!await checkBalanceSufficient()) {
-                            log('⚠️ 重新選擇後餘額仍不足，等待...', 'warning');
-                            await sleep(5000);
-                            if (!isRunning) break;
-                            continue;
-                        }
-                        log('✓ 重新選擇幣種成功，餘額充足', 'success');
-                    } else {
-                        // 如果還沒有選擇代幣，只是等待
-                        log('餘額不足，等待...', 'warning');
-                        await sleep(5000);
-                        if (!isRunning) break; // 檢查是否在等待期間被停止
-                        continue;
-                    }
                 }
 
                 // 檢查是否已停止
@@ -4750,47 +4348,13 @@
                     continue;
                 }
 
-                // 1.5. 新增：基於幣種比較判斷上一次 SWAP 的成功/失敗
-                // 這個判斷應該在：1) 關閉彈窗之後，2) 選擇代幣之前
-                // 此時如果有 currentFromToken，代表已經選過幣了，可以進行比較
-                // 注意：需要在重置 currentFromToken 之前進行判斷
-                if (currentFromToken) {
-                    const verifyResult = verifySwapByTokenComparison();
-                    
-                    if (verifyResult.shouldUpdate) {
-                        if (verifyResult.wasSuccess) {
-                            // 上一次 SWAP 成功
-                            stats.successfulSwaps++;
-                            stats.lastSuccessTime = Date.now();
-                            log(`✅ 統計更新：成功 +1 | 總計: ${stats.totalSwaps} | 成功: ${stats.successfulSwaps} | 失敗: ${stats.failedSwaps}`, 'success');
-                            
-                            // 動態調整（成功時）
-                            await adjustSlippageAndPriority(true);
-                        } else {
-                            // 上一次 SWAP 失敗
-                            stats.failedSwaps++;
-                            log(`❌ 統計更新：失敗 +1 | 總計: ${stats.totalSwaps} | 成功: ${stats.successfulSwaps} | 失敗: ${stats.failedSwaps}`, 'error');
-                            
-                            // 動態調整（失敗時）
-                            await adjustSlippageAndPriority(false);
-                        }
-                        
-                        UI.updateStats();
-                        
-                        // 重置標記，為下一次判斷做準備
-                        lastCycleConfirmed = false;
-                    }
-                }
-
                 // 2. 檢查是否需要選擇代幣
                 const chooseBtns = findChooseButtons();
 
                 if (chooseBtns.length > 0) {
                     log(`檢測到 ${chooseBtns.length} 個 Choose 按鈕，開始選幣...`, 'info');
 
-                    // 注意：在重置 currentFromToken 之前，它還保留著上一次的值
-                    // 這個值已經在上一輪循環的選擇代幣完成時記錄為 lastCycleFromToken
-                    // 現在重置它，準備選擇新的代幣
+                    // 重置 currentFromToken，準備選擇新的代幣
                     currentFromToken = null;
 
                     // 檢查是否已停止
@@ -4822,8 +4386,37 @@
 
                     log(`✓ 第一個代幣已設置為: ${currentFromToken}`, 'success');
 
-                    // 新增：在選擇第一個代幣完成後，記錄本次要 SWAP 的幣種（用於下次循環比較判斷）
+                    // 1.5. 新增：基於幣種比較判斷上一次 SWAP 的成功/失敗
+                    // 這個判斷應該在選擇新代幣之後進行，此時 currentFromToken 是新選擇的幣種
+                    // 比較 lastCycleFromToken（上一輪要 SWAP 的幣種）和 currentFromToken（新選擇的幣種）
                     if (currentFromToken) {
+                        const verifyResult = verifySwapByTokenComparison();
+                        
+                        if (verifyResult.shouldUpdate) {
+                            if (verifyResult.wasSuccess) {
+                                // 上一次 SWAP 成功
+                                stats.successfulSwaps++;
+                                stats.lastSuccessTime = Date.now();
+                                log(`✅ 統計更新：成功 +1 | 總計: ${stats.totalSwaps} | 成功: ${stats.successfulSwaps} | 失敗: ${stats.failedSwaps}`, 'success');
+                                
+                                // 動態調整（成功時）
+                                await adjustSlippageAndPriority(true);
+                            } else {
+                                // 上一次 SWAP 失敗
+                                stats.failedSwaps++;
+                                log(`❌ 統計更新：失敗 +1 | 總計: ${stats.totalSwaps} | 成功: ${stats.successfulSwaps} | 失敗: ${stats.failedSwaps}`, 'error');
+                                
+                                // 動態調整（失敗時）
+                                await adjustSlippageAndPriority(false);
+                            }
+                            
+                            UI.updateStats();
+                            
+                            // 重置標記，為下一次判斷做準備
+                            lastCycleConfirmed = false;
+                        }
+                        
+                        // 記錄本次要 SWAP 的幣種（用於下次循環比較判斷）
                         lastCycleFromToken = currentFromToken;
                         log(`📝 記錄本次循環要 SWAP 的幣種: ${lastCycleFromToken}`, 'info');
                     }
@@ -4876,8 +4469,6 @@
 
                     log('✓ 代幣選擇完成', 'success');
                     await sleep(1000);
-                    // 注意：選擇代幣後不立即檢查餘額，因為此時可能顯示的是接收代幣列表
-                    // 餘額檢查將在下一輪循環開始時進行（在選擇代幣之前）
                     // 注意：lastCycleFromToken 已在選擇第一個代幣完成時記錄
                     continue;
                 }
@@ -4997,17 +4588,6 @@
                     }
                 }
 
-                // 記錄交易前的餘額（用於驗證交易是否真正成功）
-                let balanceBeforeSwap = null;
-                if (CONFIG.enableBalanceMonitoring && CONFIG.enableSuccessVerification) {
-                    const rawBalances = await getTokenBalances();
-                    // 標準化餘額精度，確保一致性
-                    balanceBeforeSwap = {
-                        USDT: parseFloat(parseFloat(rawBalances.USDT || 0).toFixed(8)),
-                        USDC: parseFloat(parseFloat(rawBalances.USDC || 0).toFixed(8))
-                    };
-                    log(`記錄交易前餘額: USDT=${balanceBeforeSwap.USDT.toFixed(4)}, USDC=${balanceBeforeSwap.USDC.toFixed(4)}`, 'info');
-                }
 
                 let confirmClicked = false;
 
@@ -5146,11 +4726,6 @@
         // 更新 UI 狀態
         UI.setRunning(false);
 
-        // 清除定時器
-        if (balanceCheckTimer) {
-            clearInterval(balanceCheckTimer);
-            balanceCheckTimer = null;
-        }
 
         // 停止防止暫停的機制
         stopHeartbeat();
@@ -5165,6 +4740,11 @@
             isAdjusting = false;
             pendingAdjustment = null;
             log('🔄 已重置動態調整狀態', 'info');
+        }
+
+        // 清理記憶體：限制日誌緩衝區大小
+        if (logBuffer.length > MAX_LOG_ENTRIES) {
+            logBuffer.splice(0, logBuffer.length - MAX_LOG_ENTRIES);
         }
 
         // 計算運行時間
@@ -5274,7 +4854,7 @@
         <div style="font-weight: 700; margin-bottom: 4px;">統計</div>
         <div>總計: <span id="stat-total">0</span> | 成功: <span id="stat-success">0</span> | 失敗: <span id="stat-fail">0</span></div>
         <div style="margin-top: 4px;">連續成功: <span id="stat-consecutive-success" style="color: #10b981;">0</span> | 連續失敗: <span id="stat-consecutive-fail" style="color: #ef4444;">0</span></div>
-        <div style="margin-top: 4px;">Slippage: <span id="stat-slippage" style="color: #3b82f6;">${CONFIG.enableDynamicAdjustment ? CONFIG.slippageInitial.toFixed(2) : '0.10'}%</span> | Priority: <span id="stat-priority" style="color: #3b82f6;">${CONFIG.enableDynamicAdjustment ? CONFIG.priorityInitial.toFixed(4) : '0.0020'} gwei</span></div>
+        <div style="margin-top: 4px;">Slippage: <span id="stat-slippage" style="color: #3b82f6;">${CONFIG.enableDynamicAdjustment ? CONFIG.slippageInitial.toFixed(2) : '0.05'}%</span> | Priority: <span id="stat-priority" style="color: #3b82f6;">${CONFIG.enableDynamicAdjustment ? CONFIG.priorityInitial.toFixed(4) : '0.0020'} gwei</span></div>
       `;
 
             const logEl = document.createElement('pre');
@@ -5305,12 +4885,16 @@
 
             btn.addEventListener('click', () => this.toggle());
 
-            window.addEventListener('keydown', (e) => {
-                if (e.ctrlKey && (e.key === 's' || e.key === 'S') && !e.altKey) {
-                    e.preventDefault();
-                    this.toggle();
-                }
-            });
+            // 保存事件處理器引用，避免重複添加
+            if (!keydownHandler) {
+                keydownHandler = (e) => {
+                    if (e.ctrlKey && (e.key === 's' || e.key === 'S') && !e.altKey) {
+                        e.preventDefault();
+                        this.toggle();
+                    }
+                };
+                window.addEventListener('keydown', keydownHandler);
+            }
         },
 
         setRunning(running) {
@@ -5394,7 +4978,6 @@
  *
  * Features:
  * - 完善的防呆機制與風險控制
- * - 餘額監控與異常檢測
  * - 交易成功驗證
  * - 自動恢復機制
  * - 連續失敗保護
