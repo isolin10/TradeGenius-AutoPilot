@@ -3,7 +3,7 @@
 // @namespace    https://www.tradegenius.com
 // @version      1.0.0
 // @description  增強版自動 USDC/USDT 刷量腳本，具備完善的防呆機制與風險控制
-// @author       B1N0RY
+// @author       B1N0RY & Keepplay
 // @match        https://www.tradegenius.com/trade
 // @grant        none
 // @run-at       document-idle
@@ -211,7 +211,6 @@
     let lastHeartbeatTime = Date.now();  // 上次心跳時間
     let throttleDetectionEnabled = true;  // 是否啟用時間節流檢測
     let visibilityListenerSetup = false;  // 是否已設置可見性監聽器
-    let keydownHandler = null;  // 鍵盤事件處理器（用於清理）
 
     let stats = {
         totalSwaps: 0,
@@ -274,8 +273,74 @@
     const MAX_LOG_ENTRIES = 100;  // 最多保留 100 條日誌
     const MAX_LOG_TEXT_LENGTH = 5000;  // 日誌文字最多 5000 字元
 
-    const log = (msg, type = 'info') => {
+    // ==================== 錯誤日誌收集系統 ====================
+    const errorLogs = {
+        entries: [],
+        maxEntries: 500,  // 最多保留 500 條錯誤日誌
+        config: {
+            collectErrors: true,      // 收集錯誤
+            collectWarnings: true,   // 收集警告
+            collectInfo: false,      // 不收集一般資訊（減少檔案大小）
+            collectSuccess: false    // 不收集成功訊息（減少檔案大小）
+        }
+    };
+
+    // 添加日誌條目到錯誤日誌收集系統
+    function addToErrorLog(entry) {
+        if (!errorLogs.config.collectErrors && entry.type === 'error') return;
+        if (!errorLogs.config.collectWarnings && entry.type === 'warning') return;
+        if (!errorLogs.config.collectInfo && entry.type === 'info') return;
+        if (!errorLogs.config.collectSuccess && entry.type === 'success') return;
+
+        errorLogs.entries.push(entry);
+        
+        // 限制日誌條目數量
+        if (errorLogs.entries.length > errorLogs.maxEntries) {
+            errorLogs.entries.shift();
+        }
+    }
+
+    // 捕獲全局錯誤
+    const originalErrorHandler = window.onerror;
+    window.onerror = function(message, source, lineno, colno, error) {
+        const errorEntry = {
+            timestamp: new Date().toISOString(),
+            type: 'error',
+            category: 'global',
+            message: message || 'Unknown error',
+            source: source || 'unknown',
+            line: lineno || 0,
+            column: colno || 0,
+            stack: error?.stack || null,
+            url: window.location.href,
+            userAgent: navigator.userAgent
+        };
+        addToErrorLog(errorEntry);
+        
+        // 調用原始錯誤處理器（如果存在）
+        if (originalErrorHandler) {
+            return originalErrorHandler(message, source, lineno, colno, error);
+        }
+        return false;
+    };
+
+    // 捕獲未處理的 Promise 拒絕
+    window.addEventListener('unhandledrejection', function(event) {
+        const errorEntry = {
+            timestamp: new Date().toISOString(),
+            type: 'error',
+            category: 'unhandledRejection',
+            message: event.reason?.message || String(event.reason) || 'Unhandled promise rejection',
+            stack: event.reason?.stack || null,
+            url: window.location.href,
+            userAgent: navigator.userAgent
+        };
+        addToErrorLog(errorEntry);
+    });
+
+    const log = (msg, type = 'info', error = null) => {
         const time = new Date().toLocaleTimeString();
+        const timestamp = new Date().toISOString();
         const prefix = `[${time}]`;
 
         const colors = {
@@ -293,6 +358,35 @@
         };
 
         console.log(`%c${prefix} ${icons[type]} ${msg}`, `color: ${colors[type]}; font-weight: bold`);
+
+        // 添加到錯誤日誌收集系統
+        const logEntry = {
+            timestamp: timestamp,
+            type: type,
+            category: 'application',
+            message: msg,
+            stack: error?.stack || null,
+            error: error ? {
+                name: error.name,
+                message: error.message,
+                stack: error.stack
+            } : null,
+            stats: {
+                totalSwaps: stats.totalSwaps,
+                successfulSwaps: stats.successfulSwaps,
+                failedSwaps: stats.failedSwaps,
+                consecutiveFailures: consecutiveFailures,
+                lastError: stats.lastError
+            },
+            config: {
+                slippage: CONFIG.enableDynamicAdjustment ? currentSlippage : CONFIG.slippageInitial,
+                priority: CONFIG.enableDynamicAdjustment ? currentPriority : CONFIG.priorityInitial,
+                chain: CONFIG.targetChain
+            },
+            url: window.location.href,
+            userAgent: navigator.userAgent
+        };
+        addToErrorLog(logEntry);
 
         if (UI.logEl) {
             const logText = `${prefix} ${icons[type]} ${msg}\n`;
@@ -342,7 +436,7 @@
                 log('ℹ️ 瀏覽器不支援 Wake Lock API', 'info');
             }
         } catch (err) {
-            log(`⚠️ 無法啟用 Wake Lock: ${err.message}`, 'warning');
+            log(`⚠️ 無法啟用 Wake Lock: ${err.message}`, 'warning', err);
         }
     }
 
@@ -361,7 +455,7 @@
                 log('Wake Lock 已釋放', 'info');
             }
         } catch (err) {
-            log(`釋放 Wake Lock 時出錯: ${err.message}`, 'warning');
+            log(`釋放 Wake Lock 時出錯: ${err.message}`, 'warning', err);
         }
     }
 
@@ -835,7 +929,7 @@
 
             return null;
         } catch (error) {
-            log(`讀取當前發送幣失敗: ${error.message}`, 'error');
+            log(`讀取當前發送幣失敗: ${error.message}`, 'error', error);
             return null;
         }
     };
@@ -950,7 +1044,7 @@
             try {
                 await closeDialog();
             } catch (error) {
-                log(`⚠️ 關閉視窗時發生錯誤: ${error.message}`, 'warning');
+                log(`⚠️ 關閉視窗時發生錯誤: ${error.message}`, 'warning', error);
                 // 繼續嘗試，不中斷流程
             }
         }
@@ -1367,7 +1461,7 @@
             log(`⚠️ 未找到 M.Cap 選項: ${mcapText}`, 'warning');
             return false;
         } catch (error) {
-            log(`查找 M.Cap 選項時出錯: ${error.message}`, 'error');
+            log(`查找 M.Cap 選項時出錯: ${error.message}`, 'error', error);
             return false;
         }
     }
@@ -3143,7 +3237,7 @@
             }
 
         } catch (error) {
-            log(`檢測失敗信號時出錯: ${error.message}`, 'warning');
+            log(`檢測失敗信號時出錯: ${error.message}`, 'warning', error);
         }
 
         return failureSignals;
@@ -3180,7 +3274,7 @@
                 }
             }
         } catch (error) {
-            log(`檢測交易 hash 時出錯: ${error.message}`, 'warning');
+            log(`檢測交易 hash 時出錯: ${error.message}`, 'warning', error);
         }
 
         return { found: false, hash: null, url: null };
@@ -3559,15 +3653,50 @@
             
             log(`開始調整參數：Slippage → ${slippageValue}%, Priority → ${priorityValue} gwei`, 'info');
             
-            // 檢查 Settings 面板是否已打開
-            const settingsPanelCheck = document.querySelector('[class*="Settings"]') || 
-                                     document.querySelector('[role="dialog"]');
-            if (settingsPanelCheck) {
-                const panelText = settingsPanelCheck.innerText || '';
-                if (panelText.includes('Slippage') || panelText.includes('Priority')) {
-                    settingsWasOpen = true;
-                    log('Settings 面板已打開', 'info');
+            // 檢查 Settings 面板是否已打開（使用更準確的驗證方法）
+            const checkSettingsPanelOpen = () => {
+                // 方法1: 檢查是否有打開的dialog且包含Settings相關元素
+                const dialog = document.querySelector('[role="dialog"][data-state="open"]') ||
+                              document.querySelector('[role="dialog"]:not([data-state="closed"])');
+                
+                if (dialog) {
+                    // 檢查dialog內是否包含Slippage或Priority元素
+                    const hasSlippage = dialog.querySelector('[data-sentry-component="Slippage"]') !== null;
+                    const hasPriority = dialog.querySelector('svg.lucide-fuel') !== null || 
+                                       dialog.innerText.includes('Priority (Gwei)');
+                    const hasSettingsIcon = dialog.querySelector('svg.lucide-settings2, svg.lucide-settings-2') !== null;
+                    
+                    if (hasSlippage || hasPriority || hasSettingsIcon) {
+                        return true;
+                    }
+                    
+                    // 檢查dialog內文字是否包含Settings相關內容
+                    const dialogText = dialog.innerText || '';
+                    if ((dialogText.includes('Slippage') || dialogText.includes('Priority')) && 
+                        (dialogText.includes('Buy') || dialogText.includes('Sell') || dialogText.includes('Network'))) {
+                        return true;
+                    }
                 }
+                
+                // 方法2: 檢查Settings按鈕是否在dialog內（表示dialog已打開）
+                const settingsIcon = document.querySelector('svg.lucide-settings2, svg.lucide-settings-2');
+                if (settingsIcon) {
+                    const settingsDialog = settingsIcon.closest('[role="dialog"]');
+                    if (settingsDialog) {
+                        const dialogState = settingsDialog.getAttribute('data-state');
+                        if (dialogState !== 'closed') {
+                            return true;
+                        }
+                    }
+                }
+                
+                return false;
+            };
+            
+            // 檢查 Settings 面板是否已打開
+            settingsWasOpen = checkSettingsPanelOpen();
+            if (settingsWasOpen) {
+                log('Settings 面板已打開', 'info');
             }
             
             // 如果 Settings 面板未打開，則打開它
@@ -3584,20 +3713,26 @@
                     return false;
                 }
                 
-                await sleep(2000); // 等待面板完全展開
-                
-                // 驗證面板是否真的打開了
-                await sleep(500);
-                const panelOpened = document.querySelector('[class*="Settings"]') || 
-                                  (document.querySelector('[role="dialog"]') && 
-                                   (document.body.innerText.includes('Slippage') || document.body.innerText.includes('Priority')));
-                
-                if (!panelOpened) {
-                    log('❌ Settings 面板未成功打開', 'error');
-                    return false;
+                // 等待面板完全展開，並多次驗證
+                let panelOpened = false;
+                for (let verifyAttempt = 0; verifyAttempt < 5; verifyAttempt++) {
+                    await sleep(verifyAttempt === 0 ? 2000 : 500); // 第一次等待2秒，之後每次500ms
+                    panelOpened = checkSettingsPanelOpen();
+                    
+                    if (panelOpened) {
+                        log('✓ Settings 面板已打開', 'success');
+                        break;
+                    }
+                    
+                    if (verifyAttempt < 4) {
+                        log(`⚠️ Settings 面板驗證中（嘗試 ${verifyAttempt + 1}/5）...`, 'warning');
+                    }
                 }
                 
-                log('✓ Settings 面板已打開', 'success');
+                if (!panelOpened) {
+                    log('❌ Settings 面板未成功打開（已重試 5 次）', 'error');
+                    return false;
+                }
             }
             
             // 關鍵改進：在調整參數前，先確保選擇了 Optimism 鏈
@@ -3868,7 +4003,7 @@
             return true;
             
         } catch (error) {
-            log(`❌ 調整 Slippage/Priority 時出錯: ${error.message}`, 'error');
+            log(`❌ 調整 Slippage/Priority 時出錯: ${error.message}`, 'error', error);
             
             // 嘗試關閉可能打開的 Settings 面板
             try {
@@ -4349,10 +4484,35 @@
                 }
 
                 // 2. 檢查是否需要選擇代幣
-                const chooseBtns = findChooseButtons();
+                // 使用 findAllTokenSelectionButtons 來查找所有按鈕（包括已選擇的）
+                let allTokenBtns;
+                let chooseBtns;
+                try {
+                    allTokenBtns = findAllTokenSelectionButtons();
+                    chooseBtns = findChooseButtons();
+                } catch (e) {
+                    log(`查找代幣按鈕時出錯: ${e.message}`, 'error');
+                    allTokenBtns = [];
+                    chooseBtns = [];
+                }
 
-                if (chooseBtns.length > 0) {
-                    log(`檢測到 ${chooseBtns.length} 個 Choose 按鈕，開始選幣...`, 'info');
+                // 如果找到至少一個代幣選擇按鈕（無論是否已選擇），都需要處理
+                if ((allTokenBtns && allTokenBtns.length > 0) || (chooseBtns && chooseBtns.length > 0)) {
+                    // 確定第一個按鈕：優先使用已選擇的按鈕（如果存在），否則使用 Choose 按鈕
+                    const firstBtn = (allTokenBtns && allTokenBtns.length > 0) ? allTokenBtns[0] : (chooseBtns && chooseBtns.length > 0 ? chooseBtns[0] : null);
+                    if (!firstBtn) {
+                        log('無法找到有效的代幣選擇按鈕', 'error');
+                        consecutiveFailures++;
+                        await sleep(2000);
+                        continue;
+                    }
+                    const isAlreadySelected = (allTokenBtns && allTokenBtns.length > 0) && (!chooseBtns || !chooseBtns.includes(firstBtn));
+                    
+                    if (isAlreadySelected) {
+                        log(`檢測到第一個代幣已選擇（可能需要重新選擇），開始選幣...`, 'info');
+                    } else {
+                        log(`檢測到 ${chooseBtns.length} 個 Choose 按鈕，開始選幣...`, 'info');
+                    }
 
                     // 重置 currentFromToken，準備選擇新的代幣
                     currentFromToken = null;
@@ -4360,9 +4520,9 @@
                     // 檢查是否已停止
                     if (!isRunning) break;
 
-                    // 點擊第一個 Choose（發送代幣）
-                    chooseBtns[0].click();
-                    log('點擊第一個 Choose (發送)', 'info');
+                    // 點擊第一個按鈕（發送代幣），無論是否已選擇都可以點擊來重新打開選擇對話框
+                    firstBtn.click();
+                    log(`點擊第一個 ${isAlreadySelected ? '已選擇的代幣按鈕' : 'Choose'} (發送)`, 'info');
                     await sleep(CONFIG.waitAfterChoose);
 
                     // 檢查是否已停止
@@ -4428,14 +4588,22 @@
                     if (!isRunning) break;
                     
                     // 使用 findAllTokenSelectionButtons 來查找，確保即使第一個已經被選擇了也能找到第二個
-                    const allTokenBtns = findAllTokenSelectionButtons();
-                    // 如果找不到，回退到使用 findChooseButtons
-                    const chooseBtns2 = allTokenBtns.length >= 2 ? allTokenBtns : findChooseButtons();
+                    let allTokenBtns2;
+                    let chooseBtns2;
+                    try {
+                        allTokenBtns2 = findAllTokenSelectionButtons();
+                        // 如果找不到，回退到使用 findChooseButtons
+                        chooseBtns2 = (allTokenBtns2 && allTokenBtns2.length >= 2) ? allTokenBtns2 : findChooseButtons();
+                    } catch (e) {
+                        log(`查找第二個代幣按鈕時出錯: ${e.message}`, 'error');
+                        allTokenBtns2 = [];
+                        chooseBtns2 = findChooseButtons();
+                    }
 
-                    if (chooseBtns2.length > 0) {
+                    if (chooseBtns2 && chooseBtns2.length > 0) {
                         // 如果使用 findAllTokenSelectionButtons 且找到至少 2 個按鈕，點擊第二個
                         // 否則點擊第一個（因為 findChooseButtons 只會返回未選擇的按鈕）
-                        const btnToClick = (allTokenBtns.length >= 2 && chooseBtns2 === allTokenBtns) ? chooseBtns2[1] : chooseBtns2[0];
+                        const btnToClick = (allTokenBtns2 && allTokenBtns2.length >= 2 && chooseBtns2 === allTokenBtns2) ? chooseBtns2[1] : chooseBtns2[0];
                         btnToClick.click();
                         log('點擊第二個 Choose (接收)', 'info');
                         await sleep(CONFIG.waitAfterChoose);
@@ -4470,7 +4638,7 @@
                     log('✓ 代幣選擇完成', 'success');
                     await sleep(1000);
                     // 注意：lastCycleFromToken 已在選擇第一個代幣完成時記錄
-                    continue;
+                    // 代幣選擇完成後，繼續執行後續的 MAX 和 Confirm 步驟，不要直接 continue
                 }
 
                 // 3. 檢查 MAX 按鈕狀態
@@ -4645,7 +4813,7 @@
                             
                             break;
                         } catch (error) {
-                            log(`⚠️ 點擊 Confirm 時發生錯誤: ${error.message}，繼續重試...`, 'warning');
+                            log(`⚠️ 點擊 Confirm 時發生錯誤: ${error.message}，繼續重試...`, 'warning', error);
                             await sleep(500);
                             continue;
                         }
@@ -4687,7 +4855,7 @@
                 if (!isRunning) break; // 檢查是否在等待期間被停止
 
             } catch (error) {
-                log(`運行出錯: ${error.message}`, 'error');
+                log(`運行出錯: ${error.message}`, 'error', error);
                 console.error(error);
                 consecutiveFailures++;
                 stats.totalSwaps++;
@@ -4772,137 +4940,353 @@
 
             const root = document.createElement('div');
             root.style.cssText = `
-        position: fixed; right: 16px; bottom: 16px; z-index: 999999;
-        width: 340px; font-family: ui-sans-serif, system-ui, -apple-system;
-        border-radius: 12px; overflow: hidden;
-        background: rgba(17,24,39,.95); color: #e5e7eb;
-        backdrop-filter: blur(8px);
-        box-shadow: 0 10px 30px rgba(0,0,0,.3);
+        position: fixed; 
+        left: 20px; 
+        top: 20px; 
+        right: auto;
+        bottom: auto;
+        z-index: 999999;
+        width: min(380px, calc(100vw - 40px)); 
+        max-width: 380px;
+        max-height: calc(100vh - 40px);
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        border-radius: 16px; 
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        background: linear-gradient(135deg, rgba(79, 70, 229, 0.98) 0%, rgba(99, 102, 241, 0.95) 100%);
+        color: #ffffff;
+        backdrop-filter: blur(12px);
+        box-shadow: 0 20px 60px rgba(79, 70, 229, 0.4), 0 0 0 2px rgba(255, 255, 255, 0.1);
+        border: 2px solid rgba(255, 255, 255, 0.15);
       `;
 
-            // Header
+            // Header - 重新設計為更現代的樣式
             const header = document.createElement('div');
             header.style.cssText = `
-        padding: 12px 14px; display: flex; align-items: center; gap: 10px;
-        border-bottom: 1px solid rgba(255,255,255,.1);
+        padding: 16px 18px; display: flex; align-items: center; gap: 12px;
+        background: rgba(0, 0, 0, 0.2);
+        border-bottom: 2px solid rgba(255, 255, 255, 0.2);
       `;
 
+            // 狀態指示器 - 使用更大的圓形和動畫效果
             const dot = document.createElement('span');
             dot.style.cssText = `
-        width: 10px; height: 10px; border-radius: 999px;
-        background: #dc2626; display: inline-block;
+        width: 14px; height: 14px; border-radius: 50%;
+        background: #ef4444; display: inline-block;
+        box-shadow: 0 0 8px rgba(239, 68, 68, 0.6);
+        transition: all 0.3s ease;
       `;
 
             const titleWrap = document.createElement('div');
-            titleWrap.style.cssText = `display: flex; flex-direction: column; line-height: 1.2; flex: 1;`;
+            titleWrap.style.cssText = `display: flex; flex-direction: column; line-height: 1.4; flex: 1; gap: 3px;`;
 
             const title = document.createElement('div');
-            title.textContent = 'TradeGenius Auto Swap';
-            title.style.cssText = `font-weight: 700; font-size: 13px;`;
+            title.textContent = 'Genius AutoSwap';
+            title.style.cssText = `font-weight: 800; font-size: 17px; letter-spacing: 0.5px;`;
 
             const author = document.createElement('div');
-            author.textContent = 'by B1N0RY';
-            author.style.cssText = `font-size: 10px; opacity: .6; margin-top: 2px;`;
+            author.textContent = 'B1N0RY & Keepplay 開發';
+            author.style.cssText = `font-size: 13px; opacity: 0.85; font-weight: 500;`;
 
             const status = document.createElement('div');
-            status.textContent = 'STOPPED';
-            status.style.cssText = `font-size: 11px; opacity: .85; margin-top: 2px;`;
+            status.textContent = '已停止';
+            status.style.cssText = `font-size: 14px; opacity: 0.9; font-weight: 600; margin-top: 2px;`;
 
             titleWrap.appendChild(title);
             titleWrap.appendChild(author);
             titleWrap.appendChild(status);
 
+            // 按鈕 - 使用漸變和更大的尺寸
             const btn = document.createElement('button');
-            btn.textContent = 'Start (Ctrl+S)';
+            btn.textContent = '開始';
             btn.style.cssText = `
-        border: 0; cursor: pointer; color: white;
-        background: #16a34a; padding: 8px 12px; border-radius: 8px;
-        font-weight: 700; font-size: 11px; transition: all .2s;
+        border: none; cursor: pointer; color: white;
+        background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+        padding: 10px 16px; border-radius: 10px;
+        font-weight: 700; font-size: 14px; 
+        transition: all 0.3s ease;
+        box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
       `;
-            btn.onmouseover = () => btn.style.opacity = '.8';
-            btn.onmouseout = () => btn.style.opacity = '1';
+            btn.onmouseover = () => {
+                btn.style.transform = 'translateY(-2px)';
+                btn.style.boxShadow = '0 6px 16px rgba(16, 185, 129, 0.4)';
+            };
+            btn.onmouseout = () => {
+                btn.style.transform = 'translateY(0)';
+                btn.style.boxShadow = '0 4px 12px rgba(16, 185, 129, 0.3)';
+            };
 
             header.appendChild(dot);
             header.appendChild(titleWrap);
             header.appendChild(btn);
 
-            // Body
+            // Body - 使用更寬鬆的間距和不同的背景，可滾動
             const body = document.createElement('div');
-            body.style.cssText = `padding: 12px 14px;`;
+            body.style.cssText = `
+        padding: 16px 18px; 
+        background: rgba(0, 0, 0, 0.15);
+        overflow-y: auto;
+        overflow-x: hidden;
+        flex: 1;
+        min-height: 0;
+      `;
+            
+            // 添加自定義滾動條樣式
+            if (!document.getElementById('tradegenius-autopilot-scrollbar-style')) {
+                const style = document.createElement('style');
+                style.id = 'tradegenius-autopilot-scrollbar-style';
+                style.textContent = `
+        #tradegenius-autopilot-panel-body::-webkit-scrollbar {
+            width: 8px;
+        }
+        #tradegenius-autopilot-panel-body::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 4px;
+        }
+        #tradegenius-autopilot-panel-body::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.3);
+            border-radius: 4px;
+        }
+        #tradegenius-autopilot-panel-body::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.5);
+        }
+      `;
+                document.head.appendChild(style);
+            }
+            
+            // 為 body 添加 ID 以便樣式應用
+            body.id = 'tradegenius-autopilot-panel-body';
 
+            // 配置信息卡片 - 使用不同的樣式
             const info = document.createElement('div');
             info.style.cssText = `
-        font-size: 11px; opacity: .75; margin-bottom: 10px;
-        padding: 8px; border-radius: 8px;
-        background: rgba(0,0,0,.2);
-        border: 1px solid rgba(255,255,255,.05);
+        font-size: 14px; margin-bottom: 12px;
+        padding: 12px; border-radius: 10px;
+        background: rgba(255, 255, 255, 0.1);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        backdrop-filter: blur(4px);
       `;
             info.innerHTML = `
-        <div style="font-weight: 700; margin-bottom: 4px;">配置</div>
-        <div>• 代幣: USDC ⇄ USDT</div>
-        <div>• 鏈: ${CONFIG.chainDisplayName} (Optimism)</div>
-        <div>• 安全模式: 已啟用</div>
+        <div style="font-weight: 800; margin-bottom: 8px; font-size: 15px; text-transform: uppercase; letter-spacing: 0.5px;">⚙️ 系統配置</div>
+        <div style="margin: 4px 0; padding-left: 8px; border-left: 3px solid rgba(255, 255, 255, 0.3); font-size: 14px;">代幣配對: USDC ⇄ USDT</div>
+        <div style="margin: 4px 0; padding-left: 8px; border-left: 3px solid rgba(255, 255, 255, 0.3); font-size: 14px;">區塊鏈: ${CONFIG.chainDisplayName} (Optimism)</div>
+        <div style="margin: 4px 0; padding-left: 8px; border-left: 3px solid rgba(255, 255, 255, 0.3); font-size: 14px;">安全模式: ✅ 已啟用</div>
       `;
 
+            // 統計信息卡片 - 使用網格佈局
             const statsDiv = document.createElement('div');
             statsDiv.style.cssText = `
-        font-size: 10px; opacity: .7; margin-bottom: 10px;
-        padding: 8px; border-radius: 8px;
-        background: rgba(0,0,0,.15);
+        font-size: 13px; margin-bottom: 12px;
+        padding: 12px; border-radius: 10px;
+        background: rgba(255, 255, 255, 0.1);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        backdrop-filter: blur(4px);
       `;
             statsDiv.innerHTML = `
-        <div style="font-weight: 700; margin-bottom: 4px;">統計</div>
-        <div>總計: <span id="stat-total">0</span> | 成功: <span id="stat-success">0</span> | 失敗: <span id="stat-fail">0</span></div>
-        <div style="margin-top: 4px;">連續成功: <span id="stat-consecutive-success" style="color: #10b981;">0</span> | 連續失敗: <span id="stat-consecutive-fail" style="color: #ef4444;">0</span></div>
-        <div style="margin-top: 4px;">Slippage: <span id="stat-slippage" style="color: #3b82f6;">${CONFIG.enableDynamicAdjustment ? CONFIG.slippageInitial.toFixed(2) : '0.05'}%</span> | Priority: <span id="stat-priority" style="color: #3b82f6;">${CONFIG.enableDynamicAdjustment ? CONFIG.priorityInitial.toFixed(4) : '0.0020'} gwei</span></div>
+        <div style="font-weight: 800; margin-bottom: 8px; font-size: 15px; text-transform: uppercase; letter-spacing: 0.5px;">📊 交易統計</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 6px;">
+          <div style="padding: 6px; background: rgba(0, 0, 0, 0.2); border-radius: 6px;">
+            <div style="opacity: 0.8; font-size: 12px; margin-bottom: 2px;">總計</div>
+            <div style="font-weight: 700; font-size: 16px;"><span id="stat-total">0</span></div>
+          </div>
+          <div style="padding: 6px; background: rgba(0, 0, 0, 0.2); border-radius: 6px;">
+            <div style="opacity: 0.8; font-size: 12px; margin-bottom: 2px;">成功</div>
+            <div style="font-weight: 700; font-size: 16px; color: #34d399;"><span id="stat-success">0</span></div>
+          </div>
+          <div style="padding: 6px; background: rgba(0, 0, 0, 0.2); border-radius: 6px;">
+            <div style="opacity: 0.8; font-size: 12px; margin-bottom: 2px;">失敗</div>
+            <div style="font-weight: 700; font-size: 16px; color: #f87171;"><span id="stat-fail">0</span></div>
+          </div>
+          <div style="padding: 6px; background: rgba(0, 0, 0, 0.2); border-radius: 6px;">
+            <div style="opacity: 0.8; font-size: 12px; margin-bottom: 2px;">連勝</div>
+            <div style="font-weight: 700; font-size: 16px; color: #34d399;"><span id="stat-consecutive-success">0</span></div>
+          </div>
+        </div>
+        <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, 0.2);">
+          <div style="display: flex; justify-content: space-between; margin: 4px 0; font-size: 13px;">
+            <span style="opacity: 0.9;">滑點容忍度:</span>
+            <span style="font-weight: 700; color: #60a5fa;"><span id="stat-slippage">${CONFIG.enableDynamicAdjustment ? CONFIG.slippageInitial.toFixed(2) : '0.05'}%</span></span>
+          </div>
+          <div style="display: flex; justify-content: space-between; margin: 4px 0; font-size: 13px;">
+            <span style="opacity: 0.9;">優先級費用:</span>
+            <span style="font-weight: 700; color: #60a5fa;"><span id="stat-priority">${CONFIG.enableDynamicAdjustment ? CONFIG.priorityInitial.toFixed(4) : '0.0020'} gwei</span></span>
+          </div>
+          <div style="display: flex; justify-content: space-between; margin: 4px 0; font-size: 13px;">
+            <span style="opacity: 0.9;">連續失敗:</span>
+            <span style="font-weight: 700; color: #f87171;"><span id="stat-consecutive-fail">0</span></span>
+          </div>
+        </div>
       `;
 
-            const logEl = document.createElement('pre');
-            logEl.style.cssText = `
-        margin: 0; padding: 10px; border-radius: 8px;
-        background: rgba(0,0,0,.3);
-        font-size: 10px; line-height: 1.4;
-        white-space: pre-wrap; word-break: break-word;
-        max-height: 150px; overflow: auto;
-        font-family: 'Consolas', 'Monaco', monospace;
+            // 提醒信息卡片
+            const noticeDiv = document.createElement('div');
+            noticeDiv.style.cssText = `
+        font-size: 13px; margin-bottom: 0;
+        padding: 12px; border-radius: 10px;
+        background: rgba(251, 191, 36, 0.15);
+        border: 1px solid rgba(251, 191, 36, 0.3);
+        backdrop-filter: blur(4px);
       `;
-            logEl.textContent = '準備就緒。點擊 Start 或按 Ctrl+S 開始。\n';
+            noticeDiv.innerHTML = `
+        <div style="font-weight: 800; margin-bottom: 8px; font-size: 14px; color: #fbbf24; display: flex; align-items: center; gap: 6px;">
+          <span>⚠️</span>
+          <span>重要提醒</span>
+        </div>
+        <div style="margin: 6px 0; padding-left: 8px; border-left: 2px solid rgba(251, 191, 36, 0.5); font-size: 12px; line-height: 1.5; opacity: 0.95;">
+          1. 請在 <span style="color: #60a5fa; font-weight: 600;">https://www.tradegenius.com/trade</span> 頁面上使用此腳本
+        </div>
+        <div style="margin: 6px 0; padding-left: 8px; border-left: 2px solid rgba(251, 191, 36, 0.5); font-size: 12px; line-height: 1.5; opacity: 0.95;">
+          2. 保持電腦清醒，不要進入休眠與睡眠（黑畫面或重新登入），但可以關閉螢幕
+        </div>
+        <div style="margin: 6px 0; padding-left: 8px; border-left: 2px solid rgba(251, 191, 36, 0.5); font-size: 12px; line-height: 1.5; opacity: 0.95;">
+          3. 若有問題請詢問 <span style="color: #60a5fa; font-weight: 600;">Twitter/IG 好玩一直玩(Keepplay)</span> 或者加入以下LINE社群，並且tag 二進衛
+        </div>
+        <div style="margin: 6px 0; padding-left: 8px; border-left: 2px solid rgba(251, 191, 36, 0.5); font-size: 12px; line-height: 1.5; opacity: 0.95;">
+          <a href="https://line.me/ti/g2/l6DdDVkz71R2S6TdCiSZll96Y2hqwTJL5wIzNQ?utm_source=invitation&utm_medium=link_copy&utm_campaign=default" target="_blank" style="color: #60a5fa; font-weight: 600; text-decoration: none; display: inline-block; margin-top: 4px; padding: 6px 12px; background: rgba(96, 165, 250, 0.1); border-radius: 6px; transition: all 0.2s ease;">
+            📱 加入「好玩一直玩討論群」
+          </a>
+        </div>
+        <div style="margin: 6px 0; padding-left: 8px; border-left: 2px solid rgba(251, 191, 36, 0.5); font-size: 12px; line-height: 1.5; opacity: 0.95;">
+          4. 後續更新請持續追蹤 <a href="https://goldenrod-opera-26e.notion.site/Genius-AutoSwap-8730681db9d54a1fb21405976ffbf9e9?source=copy_link" target="_blank" style="color: #60a5fa; font-weight: 600; text-decoration: none;">https://goldenrod-opera-26e.notion.site/Genius-AutoSwap-8730681db9d54a1fb21405976ffbf9e9?source=copy_link</a>
+        </div>
+      `;
+
+            // 錯誤日誌導出按鈕區域
+            const exportDiv = document.createElement('div');
+            exportDiv.style.cssText = `
+        margin-top: 12px;
+        display: flex;
+        gap: 8px;
+      `;
+            
+            const btnExport = document.createElement('button');
+            btnExport.textContent = '📥 導出錯誤日誌';
+            btnExport.style.cssText = `
+        flex: 1;
+        border: none;
+        cursor: pointer;
+        color: white;
+        background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+        padding: 10px 16px;
+        border-radius: 10px;
+        font-weight: 700;
+        font-size: 13px;
+        transition: all 0.3s ease;
+        box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      `;
+            btnExport.onmouseover = () => {
+                btnExport.style.transform = 'translateY(-2px)';
+                btnExport.style.boxShadow = '0 6px 16px rgba(59, 130, 246, 0.4)';
+            };
+            btnExport.onmouseout = () => {
+                btnExport.style.transform = 'translateY(0)';
+                btnExport.style.boxShadow = '0 4px 12px rgba(59, 130, 246, 0.3)';
+            };
+            btnExport.addEventListener('click', () => exportErrorLogs());
+
+            const btnCopy = document.createElement('button');
+            btnCopy.textContent = '📋 複製日誌';
+            btnCopy.style.cssText = `
+        flex: 1;
+        border: none;
+        cursor: pointer;
+        color: white;
+        background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%);
+        padding: 10px 16px;
+        border-radius: 10px;
+        font-weight: 700;
+        font-size: 13px;
+        transition: all 0.3s ease;
+        box-shadow: 0 4px 12px rgba(139, 92, 246, 0.3);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      `;
+            btnCopy.onmouseover = () => {
+                btnCopy.style.transform = 'translateY(-2px)';
+                btnCopy.style.boxShadow = '0 6px 16px rgba(139, 92, 246, 0.4)';
+            };
+            btnCopy.onmouseout = () => {
+                btnCopy.style.transform = 'translateY(0)';
+                btnCopy.style.boxShadow = '0 4px 12px rgba(139, 92, 246, 0.3)';
+            };
+            btnCopy.addEventListener('click', () => copyErrorLogsToClipboard());
+
+            exportDiv.appendChild(btnExport);
+            exportDiv.appendChild(btnCopy);
 
             body.appendChild(info);
             body.appendChild(statsDiv);
-            body.appendChild(logEl);
+            body.appendChild(noticeDiv);
+            body.appendChild(exportDiv);
 
             root.appendChild(header);
             root.appendChild(body);
             document.body.appendChild(root);
 
+            // 添加視窗大小調整監聽器，確保面板始終在視窗內
+            const adjustPanelPosition = () => {
+                if (!root || !root.parentElement) return;
+                const rect = root.getBoundingClientRect();
+                const viewportWidth = window.innerWidth;
+                const viewportHeight = window.innerHeight;
+                
+                // 檢查右邊界
+                if (rect.right > viewportWidth - 20) {
+                    root.style.left = `${Math.max(20, viewportWidth - rect.width - 20)}px`;
+                }
+                
+                // 檢查下邊界
+                if (rect.bottom > viewportHeight - 20) {
+                    root.style.top = `${Math.max(20, viewportHeight - rect.height - 20)}px`;
+                }
+                
+                // 確保不會超出左邊界
+                if (rect.left < 20) {
+                    root.style.left = '20px';
+                }
+                
+                // 確保不會超出上邊界
+                if (rect.top < 20) {
+                    root.style.top = '20px';
+                }
+            };
+            
+            // 初始調整（使用 requestAnimationFrame 確保 DOM 已渲染）
+            requestAnimationFrame(() => {
+                adjustPanelPosition();
+                // 監聽視窗大小變化
+                window.addEventListener('resize', adjustPanelPosition);
+            });
+
             this.root = root;
             this.statusDot = dot;
             this.statusText = status;
             this.btnToggle = btn;
-            this.logEl = logEl;
+            this.logEl = null; // 不再顯示日誌
             this.statsEl = statsDiv;
 
             btn.addEventListener('click', () => this.toggle());
-
-            // 保存事件處理器引用，避免重複添加
-            if (!keydownHandler) {
-                keydownHandler = (e) => {
-                    if (e.ctrlKey && (e.key === 's' || e.key === 'S') && !e.altKey) {
-                        e.preventDefault();
-                        this.toggle();
-                    }
-                };
-                window.addEventListener('keydown', keydownHandler);
-            }
         },
 
         setRunning(running) {
             if (!this.root) return;
-            this.statusDot.style.background = running ? '#16a34a' : '#dc2626';
-            this.statusText.textContent = running ? 'RUNNING' : 'STOPPED';
-            this.btnToggle.textContent = running ? 'Stop (Ctrl+S)' : 'Start (Ctrl+S)';
-            this.btnToggle.style.background = running ? '#dc2626' : '#16a34a';
+            this.statusDot.style.background = running ? '#10b981' : '#ef4444';
+            this.statusDot.style.boxShadow = running 
+                ? '0 0 12px rgba(16, 185, 129, 0.8)' 
+                : '0 0 8px rgba(239, 68, 68, 0.6)';
+            this.statusText.textContent = running ? '運行中' : '已停止';
+            this.btnToggle.textContent = running ? '停止' : '開始';
+            this.btnToggle.style.background = running 
+                ? 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)'
+                : 'linear-gradient(135deg, #10b981 0%, #059669 100%)';
+            this.btnToggle.style.boxShadow = running
+                ? '0 4px 12px rgba(239, 68, 68, 0.3)'
+                : '0 4px 12px rgba(16, 185, 129, 0.3)';
         },
 
         updateStats() {
@@ -4945,12 +5329,155 @@
         }
     };
 
+    // ==================== 錯誤日誌導出功能 ====================
+    function exportErrorLogs() {
+        try {
+            const exportData = {
+                metadata: {
+                    scriptName: 'TradeGenius Auto Swap - Enhanced Safety Edition',
+                    version: '1.0.0',
+                    exportTime: new Date().toISOString(),
+                    exportTimestamp: Date.now(),
+                    url: window.location.href,
+                    userAgent: navigator.userAgent,
+                    browserInfo: {
+                        language: navigator.language,
+                        platform: navigator.platform,
+                        cookieEnabled: navigator.cookieEnabled,
+                        onLine: navigator.onLine
+                    }
+                },
+                config: {
+                    waitAfterChoose: CONFIG.waitAfterChoose,
+                    waitAfterTokenSelect: CONFIG.waitAfterTokenSelect,
+                    waitAfterMax: CONFIG.waitAfterMax,
+                    waitForQuoteReady: CONFIG.waitForQuoteReady,
+                    waitForQuoteStable: CONFIG.waitForQuoteStable,
+                    waitAfterQuoteStable: CONFIG.waitAfterQuoteStable,
+                    waitAfterConfirm: CONFIG.waitAfterConfirm,
+                    waitAfterClose: CONFIG.waitAfterClose,
+                    waitAfterSwitch: CONFIG.waitAfterSwitch,
+                    waitAfterTradeMin: CONFIG.waitAfterTradeMin,
+                    waitAfterTradeMax: CONFIG.waitAfterTradeMax,
+                    waitAfterSuccessPopup: CONFIG.waitAfterSuccessPopup,
+                    waitForSwapPendingMax: CONFIG.waitForSwapPendingMax,
+                    checkSwapPendingInterval: CONFIG.checkSwapPendingInterval,
+                    swapPendingExtraRetries: CONFIG.swapPendingExtraRetries,
+                    swapPendingRetryInterval: CONFIG.swapPendingRetryInterval,
+                    maxRetryConfirm: CONFIG.maxRetryConfirm,
+                    maxRetryTokenSelect: CONFIG.maxRetryTokenSelect,
+                    maxConsecutiveFailures: CONFIG.maxConsecutiveFailures,
+                    buttonLoadingTimeout: CONFIG.buttonLoadingTimeout,
+                    minIntervalBetweenSwaps: CONFIG.minIntervalBetweenSwaps,
+                    targetChain: CONFIG.targetChain,
+                    chainDisplayName: CONFIG.chainDisplayName,
+                    enableSuccessVerification: CONFIG.enableSuccessVerification,
+                    enableAutoRecovery: CONFIG.enableAutoRecovery,
+                    enableDynamicAdjustment: CONFIG.enableDynamicAdjustment,
+                    slippageInitial: CONFIG.slippageInitial,
+                    slippageMin: CONFIG.slippageMin,
+                    slippageMax: CONFIG.slippageMax,
+                    slippageIncreaseOnFailure: CONFIG.slippageIncreaseOnFailure,
+                    slippageDecreaseOnSuccess: CONFIG.slippageDecreaseOnSuccess,
+                    priorityInitial: CONFIG.priorityInitial,
+                    priorityMin: CONFIG.priorityMin,
+                    priorityMax: CONFIG.priorityMax,
+                    priorityIncreaseOnFailure: CONFIG.priorityIncreaseOnFailure,
+                    priorityDecreaseOnSuccess: CONFIG.priorityDecreaseOnSuccess,
+                    consecutiveFailureThreshold: CONFIG.consecutiveFailureThreshold,
+                    consecutiveSuccessThreshold: CONFIG.consecutiveSuccessThreshold,
+                    debug: CONFIG.debug
+                },
+                currentState: {
+                    isRunning: isRunning,
+                    currentFromToken: currentFromToken,
+                    lastSwapTime: lastSwapTime,
+                    consecutiveFailures: consecutiveFailures,
+                    consecutiveSuccesses: consecutiveSuccesses || 0,
+                    currentSlippage: CONFIG.enableDynamicAdjustment ? currentSlippage : CONFIG.slippageInitial,
+                    currentPriority: CONFIG.enableDynamicAdjustment ? currentPriority : CONFIG.priorityInitial,
+                    lastCycleFromToken: lastCycleFromToken,
+                    lastCycleConfirmed: lastCycleConfirmed
+                },
+                statistics: {
+                    totalSwaps: stats.totalSwaps,
+                    successfulSwaps: stats.successfulSwaps,
+                    failedSwaps: stats.failedSwaps,
+                    lastError: stats.lastError,
+                    lastSuccessTime: stats.lastSuccessTime,
+                    startTime: stats.startTime,
+                    runtime: stats.startTime ? Math.floor((Date.now() - stats.startTime) / 1000) : 0
+                },
+                errorLogs: errorLogs.entries,
+                summary: {
+                    totalLogEntries: errorLogs.entries.length,
+                    errorCount: errorLogs.entries.filter(e => e.type === 'error').length,
+                    warningCount: errorLogs.entries.filter(e => e.type === 'warning').length,
+                    infoCount: errorLogs.entries.filter(e => e.type === 'info').length,
+                    successCount: errorLogs.entries.filter(e => e.type === 'success').length
+                }
+            };
+
+            // 轉換為 JSON 字串
+            const jsonString = JSON.stringify(exportData, null, 2);
+            
+            // 創建 Blob 並下載
+            const blob = new Blob([jsonString], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `tradegenius-error-log-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5)}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+            log('✅ 錯誤日誌已導出', 'success');
+            return true;
+        } catch (error) {
+            log(`❌ 導出錯誤日誌時發生錯誤: ${error.message}`, 'error', error);
+            console.error('導出錯誤日誌失敗:', error);
+            return false;
+        }
+    }
+
+    // 複製錯誤日誌到剪貼板（作為備選方案）
+    function copyErrorLogsToClipboard() {
+        try {
+            const exportData = {
+                metadata: {
+                    scriptName: 'TradeGenius Auto Swap - Enhanced Safety Edition',
+                    version: '1.0.0',
+                    exportTime: new Date().toISOString(),
+                    url: window.location.href
+                },
+                statistics: {
+                    totalSwaps: stats.totalSwaps,
+                    successfulSwaps: stats.successfulSwaps,
+                    failedSwaps: stats.failedSwaps,
+                    lastError: stats.lastError
+                },
+                errorLogs: errorLogs.entries.slice(-100)  // 只複製最近 100 條
+            };
+
+            const jsonString = JSON.stringify(exportData, null, 2);
+            
+            navigator.clipboard.writeText(jsonString).then(() => {
+                log('✅ 錯誤日誌已複製到剪貼板', 'success');
+            }).catch(err => {
+                log(`❌ 複製到剪貼板失敗: ${err.message}`, 'error', err);
+            });
+        } catch (error) {
+            log(`❌ 複製錯誤日誌時發生錯誤: ${error.message}`, 'error', error);
+        }
+    }
+
     // ==================== 初始化 ====================
     function init() {
         UI.mount();
         // 設置頁面可見性監聽器（在腳本加載時就設置，不需要等到啟動）
         setupVisibilityListener();
-        log('腳本已加載。按 Ctrl+S 或點擊 Start 開始。', 'success');
+        log('腳本已加載。點擊「開始」按鈕開始。', 'success');
         log(`鏈設置: 固定使用 ${CONFIG.chainDisplayName} (Optimism) 鏈`, 'info');
         log('增強版安全模式已啟用', 'info');
         log('已啟用防止螢幕關閉時暫停的功能', 'info');
@@ -4973,18 +5500,67 @@
 })();
 
 /* ============================================================
- * Author: B1N0RY
- * Enhanced Safety Edition
- *
- * Features:
+ * TradeGenius Auto Swap - Enhanced Safety Edition
+ * 
+ * Authors: B1N0RY & Keepplay
+ * Version: 1.0.0
+ * 
+ * ============================================================
+ * CREDITS & ATTRIBUTION
+ * ============================================================
+ * 
+ * This script is based on and incorporates code from the following
+ * original works:
+ * 
+ * 1. "TradeGenius Auto Swap - Optimism USDC/USDT"
+ *    Original Author: @ferdie_jhovie
+ *    Source: tradegenius_userscript.js
+ *    - Token selection logic
+ *    - Chain selection mechanism
+ *    - Basic swap execution flow
+ * 
+ * 2. "Auto Swap Bot + Random Auto Refresh"
+ *    Original Author: 伍壹51
+ *    Source: tradegenius-autopilot.user.js
+ *    - Auto refresh functionality
+ *    - UI components and structure
+ *    - Swap loop implementation patterns
+ * 
+ * We acknowledge and thank the original authors for their contributions.
+ * This enhanced version builds upon their work with significant
+ * improvements and additional features.
+ * 
+ * ============================================================
+ * ENHANCED FEATURES
+ * ============================================================
+ * 
  * - 完善的防呆機制與風險控制
- * - 交易成功驗證
+ * - 交易成功驗證（基於幣種比較）
  * - 自動恢復機制
  * - 連續失敗保護
  * - 交易頻率控制
+ * - 動態調整 Slippage 和 Priority
  * - 詳細統計與日誌
- *
+ * - Preset 設定自動化
+ * - 防止螢幕關閉時暫停
+ * - API 請求修復補丁
+ * 
+ * ============================================================
+ * LICENSE & USAGE
+ * ============================================================
+ * 
+ * This script is released publicly for educational and personal use.
+ * 
  * NOTICE:
- * This script is released publicly.
- * Removing or modifying author attribution is NOT permitted.
+ * - Removing or modifying author attribution is NOT permitted.
+ * - This script is provided "as is" without warranty.
+ * - Use at your own risk. The authors are not responsible for any
+ *   losses or damages resulting from the use of this script.
+ * - Always test thoroughly before using in production environments.
+ * 
+ * ============================================================
+ * 
+ * Copyright (c) 2024 B1N0RY & Keepplay
+ * Based on works by @ferdie_jhovie and 伍壹51
+ * 
  * ============================================================ */
