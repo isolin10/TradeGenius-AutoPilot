@@ -167,11 +167,11 @@
         // 動態調整設置
         enableDynamicAdjustment: true,   // 啟用動態調整 Slippage 和 Priority
         // Slippage 設置
-        slippageInitial: 0.05,          // 初始 Slippage (%)
-        slippageMin: 0.01,              // Slippage 下限 (%)
+        slippageInitial: 0.01,          // 初始 Slippage (%)
+        slippageMin: 0.0001,            // Slippage 下限 (%)
         slippageMax: 0.30,              // Slippage 上限 (%)
-        slippageIncreaseOnFailure: 0.03, // 失敗時增加的 Slippage (%)
-        slippageDecreaseOnSuccess: 0.03, // 成功時減少的 Slippage (%)
+        slippageIncreaseOnFailure: 0.003, // 失敗時增加的 Slippage (%)
+        slippageDecreaseOnSuccess: 0.003, // 成功時減少的 Slippage (%)
         // Priority 設置
         priorityInitial: 0.002,         // 初始 Priority (gwei)
         priorityMin: 0.002,             // Priority 下限 (gwei)
@@ -1304,15 +1304,19 @@
             
             if (input && input.tagName === 'INPUT') {
                 const currentValue = input.value;
+                // 將兩個值都轉換為數字進行比較，使用更小的容差以支持 0.0001% 的精度
+                const currentNum = parseFloat(currentValue);
+                const expectedNum = parseFloat(expectedValue);
                 const valueMatch = currentValue === expectedValue || 
-                                 parseFloat(currentValue) === parseFloat(expectedValue) ||
-                                 Math.abs(parseFloat(currentValue) - parseFloat(expectedValue)) < 0.0001;
+                                 currentNum === expectedNum ||
+                                 (isNaN(currentNum) === false && isNaN(expectedNum) === false && 
+                                  Math.abs(currentNum - expectedNum) < 0.00001); // 使用更小的容差
                 
                 if (valueMatch) {
                     log(`✓ ${description} 值驗證成功: ${currentValue}`, 'info');
                     return true;
                 } else {
-                    log(`⚠️ ${description} 值不匹配（當前: ${currentValue}, 期望: ${expectedValue}）`, 'warning');
+                    log(`⚠️ ${description} 值不匹配（當前: ${currentValue}, 期望: ${expectedValue}, 差值: ${Math.abs(currentNum - expectedNum)}）`, 'warning');
                 }
             }
             
@@ -1470,7 +1474,7 @@
     async function setSlippageForAllMCaps(slippageValue, mode) {
         const mcapOptions = ['<1M', '1-5M', '5-20M', '>20M', 'No Data'];
         let successCount = 0;
-        const slippageValueStr = slippageValue.toFixed(2);
+        const slippageValueStr = slippageValue.toFixed(4);
         
         log(`開始為 ${mode} 方的所有 M.Cap 選項設定 Slippage 至 ${slippageValueStr}%...`, 'info');
         log(`將依次設定 ${mcapOptions.length} 個 M.Cap 選項: ${mcapOptions.join(', ')}`, 'info');
@@ -1790,8 +1794,14 @@
                                         
                                         // 驗證值是否已保存
                                         const currentValue = input.value;
-                                        if (currentValue === value || parseFloat(currentValue) === parseFloat(value)) {
-                                            log(`✓ ${description}: 設置為 ${value}（已驗證）`, 'success');
+                                        const currentNum = parseFloat(currentValue);
+                                        const valueNum = parseFloat(value);
+                                        // 使用數值比較，容差為 0.00001 以支持 0.0001% 的精度
+                                        if (currentValue === value || 
+                                            currentNum === valueNum ||
+                                            (isNaN(currentNum) === false && isNaN(valueNum) === false && 
+                                             Math.abs(currentNum - valueNum) < 0.00001)) {
+                                            log(`✓ ${description}: 設置為 ${value}（已驗證，實際值: ${currentValue}）`, 'success');
                                             await sleep(500);
                                             return true;
                                         }
@@ -2437,7 +2447,7 @@
         // 步驟 5: 設定 Buy 方的 slippage % 至初始值（為所有 M.Cap 選項設定）
         if (!isRunning) return false;
         const slippageInitialValue = CONFIG.enableDynamicAdjustment ? CONFIG.slippageInitial : 0.05;
-        const slippageInitialStr = slippageInitialValue.toFixed(2);
+        const slippageInitialStr = slippageInitialValue.toFixed(4);
         log(`步驟 5/15: 設定 Buy 方的所有 M.Cap 選項的 Slippage 至 ${slippageInitialStr}%`, 'info');
         const step5 = await setSlippageForAllMCaps(slippageInitialValue, 'Buy');
         if (step5) {
@@ -3340,7 +3350,7 @@
                 
                 // 只有當值真正改變時才進行調整
                 if (newSlippage !== currentSlippage || newPriority !== currentPriority) {
-                    log(`📉 連續成功 ${consecutiveSuccesses} 次，準備調整參數：Slippage ${currentSlippage.toFixed(2)}% → ${newSlippage.toFixed(2)}%, Priority ${currentPriority.toFixed(4)} gwei → ${newPriority.toFixed(4)} gwei`, 'info');
+                    log(`📉 連續成功 ${consecutiveSuccesses} 次，準備調整參數：Slippage ${currentSlippage.toFixed(4)}% → ${newSlippage.toFixed(4)}%, Priority ${currentPriority.toFixed(4)} gwei → ${newPriority.toFixed(4)} gwei`, 'info');
                     
                     // 使用安全調整機制
                     const adjusted = await safeAdjustParameters(newSlippage, newPriority);
@@ -3349,15 +3359,22 @@
                         currentPriority = newPriority;
                         log(`✓ 參數調整成功`, 'success');
                         UI.updateStats(); // 更新 UI 顯示
+                        // 調整成功後重置計數器
+                        consecutiveSuccesses = 0;
+                        UI.updateStats(); // 更新連續成功次數顯示
                     } else {
-                        log(`⚠️ 參數調整失敗，將在下次循環重試`, 'warning');
+                        log(`⚠️ 參數調整失敗，保留計數器以便下次重試（當前連續成功: ${consecutiveSuccesses}）`, 'warning');
+                        // 調整失敗時不重置計數器，保留以便下次達到閾值時重試
+                        // 但為了避免無限累積，如果連續成功次數過多，則重置
+                        if (consecutiveSuccesses >= CONFIG.consecutiveSuccessThreshold * 2) {
+                            log(`⚠️ 連續成功次數過多（${consecutiveSuccesses}），重置計數器以避免無限累積`, 'warning');
+                            consecutiveSuccesses = CONFIG.consecutiveSuccessThreshold - 1; // 重置為接近閾值的值，以便下次快速觸發
+                            UI.updateStats();
+                        }
                     }
-                    // 無論調整是否成功，都重置計數器（避免重複觸發）
-                    consecutiveSuccesses = 0;
-                    UI.updateStats(); // 更新連續成功次數顯示
                 } else {
                     // 已達到下限，重置計數器
-                    log(`ℹ️ 連續成功 ${consecutiveSuccesses} 次，但參數已達下限，重置計數器`, 'info');
+                    log(`ℹ️ 連續成功 ${consecutiveSuccesses} 次，但參數已達下限（Slippage: ${currentSlippage.toFixed(4)}%, Priority: ${currentPriority.toFixed(4)} gwei），重置計數器`, 'info');
                     consecutiveSuccesses = 0;
                     UI.updateStats(); // 更新連續成功次數顯示
                 }
@@ -3380,7 +3397,7 @@
                 
                 // 只有當值真正改變時才進行調整
                 if (newSlippage !== currentSlippage || newPriority !== currentPriority) {
-                    log(`📈 連續失敗 ${consecutiveFailures} 次，準備調整參數：Slippage ${currentSlippage.toFixed(2)}% → ${newSlippage.toFixed(2)}%, Priority ${currentPriority.toFixed(4)} gwei → ${newPriority.toFixed(4)} gwei`, 'warning');
+                    log(`📈 連續失敗 ${consecutiveFailures} 次，準備調整參數：Slippage ${currentSlippage.toFixed(4)}% → ${newSlippage.toFixed(4)}%, Priority ${currentPriority.toFixed(4)} gwei → ${newPriority.toFixed(4)} gwei`, 'warning');
                     
                     // 使用安全調整機制
                     const adjusted = await safeAdjustParameters(newSlippage, newPriority);
@@ -3389,15 +3406,22 @@
                         currentPriority = newPriority;
                         log(`✓ 參數調整成功`, 'success');
                         UI.updateStats(); // 更新 UI 顯示
+                        // 調整成功後重置計數器
+                        consecutiveFailures = 0;
+                        UI.updateStats(); // 更新連續失敗次數顯示
                     } else {
-                        log(`⚠️ 參數調整失敗，將在下次循環重試`, 'warning');
+                        log(`⚠️ 參數調整失敗，保留計數器以便下次重試（當前連續失敗: ${consecutiveFailures}）`, 'warning');
+                        // 調整失敗時不重置計數器，保留以便下次達到閾值時重試
+                        // 但為了避免無限累積，如果連續失敗次數過多，則重置
+                        if (consecutiveFailures >= CONFIG.consecutiveFailureThreshold * 2) {
+                            log(`⚠️ 連續失敗次數過多（${consecutiveFailures}），重置計數器以避免無限累積`, 'warning');
+                            consecutiveFailures = CONFIG.consecutiveFailureThreshold - 1; // 重置為接近閾值的值，以便下次快速觸發
+                            UI.updateStats();
+                        }
                     }
-                    // 無論調整是否成功，都重置計數器（避免重複觸發）
-                    consecutiveFailures = 0;
-                    UI.updateStats(); // 更新連續失敗次數顯示
                 } else {
                     // 已達到上限，重置計數器
-                    log(`ℹ️ 連續失敗 ${consecutiveFailures} 次，但參數已達上限，重置計數器`, 'info');
+                    log(`ℹ️ 連續失敗 ${consecutiveFailures} 次，但參數已達上限（Slippage: ${currentSlippage.toFixed(4)}%, Priority: ${currentPriority.toFixed(4)} gwei），重置計數器`, 'info');
                     consecutiveFailures = 0;
                     UI.updateStats(); // 更新連續失敗次數顯示
                 }
@@ -3648,7 +3672,7 @@
         let settingsWasOpen = false;
         
         try {
-            const slippageValue = slippage.toFixed(2);
+            const slippageValue = slippage.toFixed(4);
             const priorityValue = priority.toFixed(4);
             
             log(`開始調整參數：Slippage → ${slippageValue}%, Priority → ${priorityValue} gwei`, 'info');
@@ -3754,39 +3778,13 @@
             }
             await sleep(1000);
 
-            // 設定 Buy 方的 Slippage
-            log(`設定 Buy 方的 Slippage 至 ${slippageValue}%...`, 'info');
-            const buySlippageSuccess = await findAndSetInput([
-                { type: 'text', text: 'Slippage' },
-                { type: 'data-attr', attr: 'data-sentry-component', value: 'Slippage' }
-            ], slippageValue, 'Buy 方的 Slippage');
+            // 設定 Buy 方的 Slippage（為所有 M.Cap 選項設定）
+            log(`設定 Buy 方的所有 M.Cap 選項的 Slippage 至 ${slippageValue}%...`, 'info');
+            const buySlippageSuccess = await setSlippageForAllMCaps(slippage, 'Buy');
             
             if (!buySlippageSuccess) {
-                log('❌ Buy 方的 Slippage 設定失敗', 'error');
-                return false;
-            }
-            
-            // 驗證 Buy 方的 Slippage（重試最多 3 次）
-            let buySlippageVerified = false;
-            for (let i = 0; i < 3; i++) {
-                await sleep(800);
-                buySlippageVerified = await verifyInputValue('Slippage', slippageValue);
-                if (buySlippageVerified) {
-                    log(`✓ Buy 方的 Slippage 驗證通過: ${slippageValue}%`, 'success');
-                    break;
-                }
-                if (i < 2) {
-                    log(`⚠️ Buy 方的 Slippage 驗證失敗，重試 ${i + 1}/3...`, 'warning');
-                    await findAndSetInput([
-                        { type: 'text', text: 'Slippage' },
-                        { type: 'data-attr', attr: 'data-sentry-component', value: 'Slippage' }
-                    ], slippageValue, 'Buy 方的 Slippage');
-                }
-            }
-            
-            if (!buySlippageVerified) {
-                log('❌ Buy 方的 Slippage 驗證失敗（已重試 3 次）', 'error');
-                return false;
+                log('⚠️ Buy 方的 M.Cap Slippage 設定未完全成功，但將繼續', 'warning');
+                // 不直接返回 false，因為可能部分選項設定成功
             }
 
             // 設定 Buy 方的 Priority
@@ -3830,39 +3828,13 @@
             }
             await sleep(1000);
 
-            // 設定 Sell 方的 Slippage
-            log(`設定 Sell 方的 Slippage 至 ${slippageValue}%...`, 'info');
-            const sellSlippageSuccess = await findAndSetInput([
-                { type: 'text', text: 'Slippage' },
-                { type: 'data-attr', attr: 'data-sentry-component', value: 'Slippage' }
-            ], slippageValue, 'Sell 方的 Slippage');
+            // 設定 Sell 方的 Slippage（為所有 M.Cap 選項設定）
+            log(`設定 Sell 方的所有 M.Cap 選項的 Slippage 至 ${slippageValue}%...`, 'info');
+            const sellSlippageSuccess = await setSlippageForAllMCaps(slippage, 'Sell');
             
             if (!sellSlippageSuccess) {
-                log('❌ Sell 方的 Slippage 設定失敗', 'error');
-                return false;
-            }
-            
-            // 驗證 Sell 方的 Slippage（重試最多 3 次）
-            let sellSlippageVerified = false;
-            for (let i = 0; i < 3; i++) {
-                await sleep(800);
-                sellSlippageVerified = await verifyInputValue('Slippage', slippageValue);
-                if (sellSlippageVerified) {
-                    log(`✓ Sell 方的 Slippage 驗證通過: ${slippageValue}%`, 'success');
-                    break;
-                }
-                if (i < 2) {
-                    log(`⚠️ Sell 方的 Slippage 驗證失敗，重試 ${i + 1}/3...`, 'warning');
-                    await findAndSetInput([
-                        { type: 'text', text: 'Slippage' },
-                        { type: 'data-attr', attr: 'data-sentry-component', value: 'Slippage' }
-                    ], slippageValue, 'Sell 方的 Slippage');
-                }
-            }
-            
-            if (!sellSlippageVerified) {
-                log('❌ Sell 方的 Slippage 驗證失敗（已重試 3 次）', 'error');
-                return false;
+                log('⚠️ Sell 方的 M.Cap Slippage 設定未完全成功，但將繼續', 'warning');
+                // 不直接返回 false，因為可能部分選項設定成功
             }
 
             // 設定 Sell 方的 Priority
@@ -4408,7 +4380,7 @@
             consecutiveFailures = 0;
             currentSlippage = CONFIG.slippageInitial;
             currentPriority = CONFIG.priorityInitial;
-            log(`🔄 動態調整已重置：Slippage=${currentSlippage.toFixed(2)}%, Priority=${currentPriority.toFixed(4)} gwei`, 'info');
+            log(`🔄 動態調整已重置：Slippage=${currentSlippage.toFixed(4)}%, Priority=${currentPriority.toFixed(4)} gwei`, 'info');
             UI.updateStats(); // 更新 UI 顯示
         }
 
@@ -5108,7 +5080,7 @@
         <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, 0.2);">
           <div style="display: flex; justify-content: space-between; margin: 4px 0; font-size: 13px;">
             <span style="opacity: 0.9;">滑點容忍度:</span>
-            <span style="font-weight: 700; color: #60a5fa;"><span id="stat-slippage">${CONFIG.enableDynamicAdjustment ? CONFIG.slippageInitial.toFixed(2) : '0.05'}%</span></span>
+            <span style="font-weight: 700; color: #60a5fa;"><span id="stat-slippage">${CONFIG.enableDynamicAdjustment ? CONFIG.slippageInitial.toFixed(4) : '0.0500'}%</span></span>
           </div>
           <div style="display: flex; justify-content: space-between; margin: 4px 0; font-size: 13px;">
             <span style="opacity: 0.9;">優先級費用:</span>
@@ -5313,7 +5285,7 @@
             
             // 更新 Slippage 和 Priority
             if (slippageEl && CONFIG.enableDynamicAdjustment) {
-                slippageEl.textContent = `${currentSlippage.toFixed(2)}%`;
+                slippageEl.textContent = `${currentSlippage.toFixed(4)}%`;
             }
             if (priorityEl && CONFIG.enableDynamicAdjustment) {
                 priorityEl.textContent = `${currentPriority.toFixed(4)} gwei`;
