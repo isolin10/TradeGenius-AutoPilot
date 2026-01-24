@@ -2071,6 +2071,294 @@
         return false;
     }
     
+    // 設定聚合器來源（只開啟指定的聚合器）
+    async function configureAggregators(enabledAggregators = ['odos', '0x', 'KyberSwap', 'OpenOcean', 'UniswapV3', 'Ve33']) {
+        // 初始等待，確保 UI 完全展開
+        await sleep(1500);
+        
+        for (let attempt = 0; attempt < 10; attempt++) {
+            // 查找 EVM 區塊標籤
+            const allElements = Array.from(document.querySelectorAll('*'));
+            let evmLabel = null;
+            
+            // 查找包含 "EVM" 文字的標籤（在 Aggregator/Fast Swaps 區域內）
+            // 優先查找包含 "text-sm" 類的元素（根據 HTML 結構）
+            for (const el of allElements) {
+                const text = el.innerText?.trim() || el.textContent?.trim();
+                if (text === 'EVM') {
+                    const elClasses = typeof el.className === 'string' ? el.className : (el.className?.baseVal || el.className?.toString() || '');
+                    
+                    // 檢查是否符合 HTML 結構（text-sm text-genius-cream/50）
+                    const hasCorrectClasses = elClasses.includes('text-sm') || elClasses.includes('text-genius-cream');
+                    
+                    // 確認這是在 Aggregator/Fast Swaps 區域內的 EVM 標籤
+                    // 檢查是否在包含 "Aggregator" 或 "Fast Swaps" 的區域內
+                    const parent = el.parentElement;
+                    const parentText = parent?.innerText || parent?.textContent || '';
+                    const hasAggregatorContext = parentText.includes('Aggregator') || 
+                                                parentText.includes('Fast Swaps') ||
+                                                parentText.includes('Globally disable');
+                    
+                    // 或者檢查是否在 pl-2.5 容器內（根據 HTML 結構）
+                    const inPlContainer = el.closest('[class*="pl-2.5"]');
+                    
+                    // 檢查父元素或祖先元素是否包含聚合器相關內容
+                    let ancestor = el.parentElement;
+                    let foundAggregatorSection = false;
+                    for (let i = 0; i < 5 && ancestor; i++) {
+                        const ancestorText = ancestor?.innerText || ancestor?.textContent || '';
+                        if (ancestorText.includes('Aggregator') || ancestorText.includes('Fast Swaps') ||
+                            ancestorText.includes('Globally disable') || ancestorText.includes('odos') ||
+                            ancestorText.includes('KyberSwap') || ancestorText.includes('0x')) {
+                            foundAggregatorSection = true;
+                            break;
+                        }
+                        ancestor = ancestor.parentElement;
+                    }
+                    
+                    if (hasCorrectClasses || hasAggregatorContext || inPlContainer || foundAggregatorSection) {
+                        evmLabel = el;
+                        log(`✓ 找到 EVM 標籤（類: ${elClasses.substring(0, 50)}）`, 'info');
+                        break;
+                    }
+                }
+            }
+            
+            if (!evmLabel) {
+                if (attempt < 9) {
+                    await sleep(attempt < 3 ? 1000 : 1500);
+                    continue;
+                }
+                log('⚠️ 未找到 EVM 區塊標籤', 'warning');
+                return false;
+            }
+            
+            // 找到 EVM 區塊容器
+            // 根據 HTML 結構，EVM 標籤的下一個兄弟元素就是包含聚合器的容器
+            let evmContainer = null;
+            
+            // 方法1: 查找下一個兄弟元素（包含 border-genius-blue 和 rounded-sm）
+            let sibling = evmLabel.nextElementSibling;
+            while (sibling) {
+                const siblingClasses = typeof sibling.className === 'string' ? sibling.className : (sibling.className?.baseVal || sibling.className?.toString() || '');
+                if (siblingClasses.includes('border-genius-blue') && siblingClasses.includes('rounded-sm')) {
+                    evmContainer = sibling;
+                    break;
+                }
+                sibling = sibling.nextElementSibling;
+            }
+            
+            // 方法2: 如果沒找到，查找父元素的下一個兄弟元素
+            if (!evmContainer && evmLabel.parentElement) {
+                sibling = evmLabel.parentElement.nextElementSibling;
+                while (sibling) {
+                    const siblingClasses = typeof sibling.className === 'string' ? sibling.className : (sibling.className?.baseVal || sibling.className?.toString() || '');
+                    if (siblingClasses.includes('border-genius-blue') && siblingClasses.includes('rounded-sm')) {
+                        evmContainer = sibling;
+                        break;
+                    }
+                    sibling = sibling.nextElementSibling;
+                }
+            }
+            
+            // 方法3: 向上查找包含 border-genius-blue 的容器
+            if (!evmContainer) {
+                evmContainer = evmLabel.closest('[class*="border-genius-blue"][class*="rounded-sm"]');
+            }
+            
+            // 方法4: 在父容器中查找
+            if (!evmContainer) {
+                let parent = evmLabel.parentElement;
+                for (let i = 0; i < 5 && parent; i++) {
+                    const children = Array.from(parent.children);
+                    for (const child of children) {
+                        const childClasses = typeof child.className === 'string' ? child.className : (child.className?.baseVal || child.className?.toString() || '');
+                        if (childClasses.includes('border-genius-blue') && childClasses.includes('rounded-sm') && 
+                            childClasses.includes('p-2.5')) {
+                            evmContainer = child;
+                            break;
+                        }
+                    }
+                    if (evmContainer) break;
+                    parent = parent.parentElement;
+                }
+            }
+            
+            if (!evmContainer) {
+                if (attempt < 9) {
+                    log(`⚠️ 嘗試 ${attempt + 1}/10: 未找到 EVM 區塊容器，等待後重試...`, 'warning');
+                    await sleep(attempt < 3 ? 1500 : 2000);
+                    continue;
+                }
+                log('⚠️ 未找到 EVM 區塊容器', 'warning');
+                return false;
+            }
+            
+            log(`✓ 找到 EVM 區塊容器`, 'info');
+            
+            // 在 EVM 容器中查找所有聚合器選項
+            // 嘗試多種選擇器來找到聚合器選項
+            let aggregatorItems = Array.from(evmContainer.querySelectorAll('[class*="flex items-center gap-2 justify-between w-full"]'));
+            
+            // 如果沒找到，嘗試更寬鬆的選擇器
+            if (aggregatorItems.length === 0) {
+                aggregatorItems = Array.from(evmContainer.querySelectorAll('[class*="flex items-center gap-2 justify-between"]'));
+            }
+            
+            // 如果還是沒找到，查找所有包含 switch 的 flex 容器
+            if (aggregatorItems.length === 0) {
+                const allFlexItems = Array.from(evmContainer.querySelectorAll('[class*="flex"]'));
+                aggregatorItems = allFlexItems.filter(item => {
+                    const hasSwitch = item.querySelector('button[role="switch"]');
+                    const hasText = item.textContent && item.textContent.trim().length > 0 && item.textContent.trim().length < 30;
+                    return hasSwitch && hasText;
+                });
+            }
+            
+            log(`找到 ${aggregatorItems.length} 個聚合器選項`, 'info');
+            
+            let foundAny = false;
+            let successCount = 0;
+            
+            // 處理每個聚合器選項
+            for (const item of aggregatorItems) {
+                // 查找聚合器名稱（文字標籤）
+                // 優先查找包含 "capitalize" 類的元素（聚合器名稱通常有這個類）
+                let aggregatorName = null;
+                const capitalizeElements = Array.from(item.querySelectorAll('div[class*="capitalize"]'));
+                
+                if (capitalizeElements.length > 0) {
+                    for (const textEl of capitalizeElements) {
+                        const text = textEl.innerText?.trim() || textEl.textContent?.trim();
+                        if (text && text.length > 0 && text.length < 30) {
+                            // 排除明顯不是聚合器名稱的元素
+                            if (!text.includes(':') && !text.includes('(') && !text.includes(')') && 
+                                !text.includes('M. Cap') && !text.includes('EVM') && !text.includes('Solana')) {
+                                aggregatorName = text;
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // 如果沒找到，嘗試查找所有 text-xs 元素
+                if (!aggregatorName) {
+                    const textElements = Array.from(item.querySelectorAll('div[class*="text-xs"]'));
+                    for (const textEl of textElements) {
+                        const text = textEl.innerText?.trim() || textEl.textContent?.trim();
+                        if (text && text.length > 0 && text.length < 30) {
+                            // 排除明顯不是聚合器名稱的元素
+                            if (!text.includes(':') && !text.includes('(') && !text.includes(')') && 
+                                !text.includes('M. Cap') && !text.includes('EVM') && !text.includes('Solana')) {
+                                // 檢查是否可能是聚合器名稱（通常是簡短的單詞）
+                                const possibleNames = ['odos', '0x', 'kyber', 'openocean', 'okx', 'lifi', 'jupiter', 'raydium', 'uniswap', 've33', 'evmdirectpool', 'lfj', 'algebra'];
+                                const normalizedText = text.toLowerCase();
+                                if (possibleNames.some(name => normalizedText.includes(name) || name.includes(normalizedText))) {
+                                    aggregatorName = text;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if (!aggregatorName) {
+                    // 如果找不到名稱，跳過這個項目
+                    continue;
+                }
+                
+                // 查找對應的 switch 按鈕
+                const switchBtn = item.querySelector('button[role="switch"]');
+                if (!switchBtn) {
+                    log(`⚠️ 找到聚合器 "${aggregatorName}" 但沒有找到 switch 按鈕`, 'warning');
+                    continue;
+                }
+                
+                foundAny = true;
+                log(`處理聚合器: ${aggregatorName}`, 'info');
+                
+                // 檢查是否為目標聚合器（不區分大小寫，並處理各種變體）
+                const normalizedName = aggregatorName.toLowerCase().trim();
+                const isTarget = enabledAggregators.some(agg => {
+                    const normalizedAgg = agg.toLowerCase().trim();
+                    // 完全匹配
+                    if (normalizedName === normalizedAgg) return true;
+                    // 處理 "KyberSwap" vs "kyberswap" 或 "kyber"
+                    if (normalizedName.includes('kyber') && normalizedAgg.includes('kyber')) return true;
+                    // 處理 "0x" 的特殊情況
+                    if (normalizedName === '0x' && normalizedAgg === '0x') return true;
+                    // 處理 "odos" vs "Odos"
+                    if (normalizedName === 'odos' && normalizedAgg === 'odos') return true;
+                    // 處理 "OpenOcean" vs "openocean"
+                    if (normalizedName.includes('openocean') && normalizedAgg.includes('openocean')) return true;
+                    // 處理 "UniswapV3" vs "uniswapv3" 或 "uniswap v3"
+                    if (normalizedName.includes('uniswap') && normalizedAgg.includes('uniswap')) {
+                        // 檢查版本號
+                        const nameHasV3 = normalizedName.includes('v3') || normalizedName.includes('3');
+                        const aggHasV3 = normalizedAgg.includes('v3') || normalizedAgg.includes('3');
+                        if (nameHasV3 && aggHasV3) return true;
+                        // 如果其中一個沒有版本號，也允許匹配（但優先匹配有版本號的）
+                        if (!nameHasV3 && !aggHasV3) return true;
+                    }
+                    // 處理 "Ve33" vs "ve33" 或 "ve 33"
+                    if (normalizedName.includes('ve33') || normalizedName.includes('ve 33')) {
+                        if (normalizedAgg.includes('ve33') || normalizedAgg.includes('ve 33')) return true;
+                    }
+                    return false;
+                });
+                
+                // 檢查當前狀態
+                const isChecked = switchBtn.getAttribute('aria-checked') === 'true' ||
+                                 switchBtn.getAttribute('data-state') === 'checked';
+                
+                // 滾動到元素可見位置
+                switchBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                await sleep(300);
+                
+                if (isTarget) {
+                    // 目標聚合器：確保開啟
+                    if (!isChecked) {
+                        switchBtn.click();
+                        log(`✓ 已開啟聚合器: ${aggregatorName}`, 'success');
+                        successCount++;
+                        await sleep(500);
+                    } else {
+                        log(`✓ 聚合器已開啟: ${aggregatorName}`, 'info');
+                        successCount++;
+                    }
+                } else {
+                    // 非目標聚合器：確保關閉
+                    if (isChecked) {
+                        switchBtn.click();
+                        log(`✓ 已關閉聚合器: ${aggregatorName}`, 'success');
+                        successCount++;
+                        await sleep(500);
+                    } else {
+                        log(`✓ 聚合器已關閉: ${aggregatorName}`, 'info');
+                        successCount++;
+                    }
+                }
+            }
+            
+            if (foundAny && successCount > 0) {
+                log(`✓ 聚合器設定完成（已處理 ${successCount} 個聚合器）`, 'success');
+                await sleep(1000);
+                return true;
+            }
+            
+            if (!foundAny) {
+                log(`⚠️ 嘗試 ${attempt + 1}/10: 未找到任何聚合器選項，等待後重試...`, 'warning');
+            }
+            
+            if (attempt < 9) {
+                await sleep(attempt < 3 ? 1500 : 2000);
+            }
+        }
+        
+        log('⚠️ 未找到任何聚合器選項', 'warning');
+        return false;
+    }
+    
     // 點擊 Buy 或 Sell 按鈕
     async function clickBuyOrSellButton(mode) {
         // mode: 'Buy' 或 'Sell'
@@ -2155,7 +2443,7 @@
         
         // 步驟 1: 點擊 Settings 按鈕
         if (!isRunning) return false;
-        log('步驟 1/15: 點擊 Settings 按鈕', 'info');
+        log('步驟 1/16: 點擊 Settings 按鈕', 'info');
         const step1 = await findAndClickElement([
             'svg.lucide-settings2',
             'svg.lucide-settings-2',
@@ -2165,7 +2453,7 @@
         if (step1) successCount++;
         
         // 步驟 2: 點選設定 PreSet 的鏈（NetworkButton）
-        log('步驟 2/15: 點擊 Network 選擇按鈕', 'info');
+        log('步驟 2/16: 點擊 Network 選擇按鈕', 'info');
         const step2 = await findAndClickElement([
             '[data-sentry-component="NetworkButton"]',
             { type: 'text', text: 'Solana' },
@@ -2174,7 +2462,7 @@
         if (step2) successCount++;
         
         // 步驟 3: 選擇 OP 鏈
-        log('步驟 3/15: 選擇 Optimism 鏈', 'info');
+        log('步驟 3/16: 選擇 Optimism 鏈', 'info');
         let optimismFound = false;
         
         for (let attempt = 0; attempt < 5; attempt++) {
@@ -2440,7 +2728,7 @@
         
         // 步驟 4: 點擊 Buy 按鈕
         if (!isRunning) return false;
-        log('步驟 4/15: 點擊 Buy 按鈕', 'info');
+        log('步驟 4/16: 點擊 Buy 按鈕', 'info');
         const step4 = await clickBuyOrSellButton('Buy');
         if (step4) successCount++;
         
@@ -2448,7 +2736,7 @@
         if (!isRunning) return false;
         const slippageInitialValue = CONFIG.enableDynamicAdjustment ? CONFIG.slippageInitial : 0.05;
         const slippageInitialStr = slippageInitialValue.toFixed(4);
-        log(`步驟 5/15: 設定 Buy 方的所有 M.Cap 選項的 Slippage 至 ${slippageInitialStr}%`, 'info');
+        log(`步驟 5/16: 設定 Buy 方的所有 M.Cap 選項的 Slippage 至 ${slippageInitialStr}%`, 'info');
         const step5 = await setSlippageForAllMCaps(slippageInitialValue, 'Buy');
         if (step5) {
             successCount++;
@@ -2490,13 +2778,13 @@
         
         // 步驟 7: 點擊 Sell 按鈕
         if (!isRunning) return false;
-        log('步驟 7/15: 點擊 Sell 按鈕', 'info');
+        log('步驟 7/16: 點擊 Sell 按鈕', 'info');
         const step7 = await clickBuyOrSellButton('Sell');
         if (step7) successCount++;
         
         // 步驟 8: 設定 Sell 方的 slippage % 至初始值（為所有 M.Cap 選項設定）
         if (!isRunning) return false;
-        log(`步驟 8/15: 設定 Sell 方的所有 M.Cap 選項的 Slippage 至 ${slippageInitialStr}%`, 'info');
+        log(`步驟 8/16: 設定 Sell 方的所有 M.Cap 選項的 Slippage 至 ${slippageInitialStr}%`, 'info');
         const step8 = await setSlippageForAllMCaps(slippageInitialValue, 'Sell');
         if (step8) {
             successCount++;
@@ -2508,7 +2796,7 @@
         
         // 步驟 9: 設定 Sell 方的 Priority (Gwei) 至初始值
         if (!isRunning) return false;
-        log(`步驟 9/15: 設定 Sell 方的 Priority (Gwei) 至 ${priorityInitialStr}`, 'info');
+        log(`步驟 9/16: 設定 Sell 方的 Priority (Gwei) 至 ${priorityInitialStr}`, 'info');
         const step9 = await findAndSetInput([
             { type: 'text', text: 'Priority (Gwei)' }
         ], priorityInitialStr, 'Sell 方的 Priority (Gwei)');
@@ -2603,7 +2891,7 @@
         
         // 步驟 11: 點選 Aggregator/Fast Swaps 設定
         if (!isRunning) return false;
-        log('步驟 11/15: 點擊 Aggregator/Fast Swaps', 'info');
+        log('步驟 11/16: 點擊 Aggregator/Fast Swaps', 'info');
         const step11 = await findAndClickElement([
             { type: 'text', text: 'Aggregator/Fast Swaps' },
             'div.cursor-pointer[class*="hover:bg-genius-pink"]',
@@ -2630,31 +2918,40 @@
             await sleep(2000);
         }
         
-        // 步驟 12: 打開 Globally disable fast swaps 中的 EVM
+        // 步驟 12: 設定聚合器來源（只開啟 odos、0x、KyberSwap、OpenOcean、UniswapV3、Ve33）
         if (!isRunning) return false;
-        log('步驟 12/15: 開啟 Globally disable fast swaps (EVM)', 'info');
-        const step12 = await findAndToggleSwitch(
+        log('步驟 12/16: 設定聚合器來源（只開啟 odos、0x、KyberSwap、OpenOcean、UniswapV3、Ve33）', 'info');
+        const step12 = await configureAggregators(['odos', '0x', 'KyberSwap', 'OpenOcean', 'UniswapV3', 'Ve33']);
+        if (step12) {
+            successCount++;
+            await sleep(1000);
+        }
+        
+        // 步驟 13: 打開 Globally disable fast swaps 中的 EVM
+        if (!isRunning) return false;
+        log('步驟 13/16: 開啟 Globally disable fast swaps (EVM)', 'info');
+        const step13 = await findAndToggleSwitch(
             'Globally disable fast swaps (EVM)',
             'Globally disable fast swaps',
             true,
             '(EVM)'
         );
-        if (step12) successCount++;
+        if (step13) successCount++;
         
-        // 步驟 13: 打開 EVM Simulations
+        // 步驟 14: 打開 EVM Simulations
         if (!isRunning) return false;
-        log('步驟 13/15: 開啟 EVM Simulations', 'info');
-        const step13 = await findAndToggleSwitch(
+        log('步驟 14/16: 開啟 EVM Simulations', 'info');
+        const step14 = await findAndToggleSwitch(
             'EVM Simulations',
             'EVM Simulations',
             true
         );
-        if (step13) successCount++;
+        if (step14) successCount++;
         
-        // 步驟 14: 點選 Fees 設定
+        // 步驟 15: 點選 Fees 設定
         if (!isRunning) return false;
-        log('步驟 14/15: 點擊 Fees 設定', 'info');
-        const step14 = await findAndClickElement([
+        log('步驟 15/16: 點擊 Fees 設定', 'info');
+        const step15 = await findAndClickElement([
             { type: 'text', text: 'Fees' },
             'div.cursor-pointer[class*="hover:bg-genius-pink"]',
             'div[class*="cursor-pointer"][class*="hover:bg-genius-pink"]'
@@ -2696,21 +2993,21 @@
             log('⚠️ Fees 設定展開驗證失敗（未找到 Show Fees）', 'warning');
             return false;
         });
-        if (step14) {
+        if (step15) {
             successCount++;
             // 額外等待時間確保 UI 完全展開
             await sleep(2000);
         }
         
-        // 步驟 15: 打開 Show Fees
+        // 步驟 16: 打開 Show Fees
         if (!isRunning) return false;
-        log('步驟 15/15: 開啟 Show Fees', 'info');
-        const step15 = await findAndToggleSwitch(
+        log('步驟 16/16: 開啟 Show Fees', 'info');
+        const step16 = await findAndToggleSwitch(
             'Show Fees',
             'Show Fees',
             true
         );
-        if (step15) successCount++;
+        if (step16) successCount++;
         
         // 步驟 16: 點擊關閉按鈕關閉設定面板
         if (!isRunning) return false;
@@ -3008,8 +3305,8 @@
             return false;
         }
 
-        // 3. 先 hover 到代幣行，觸發鏈選擇菜單（參考 tradegenius-autopilot.user.js）
-        log('懸浮到代幣行以觸發鏈選擇菜單...', 'info');
+        // 3. 只 hover 到代幣行，觸發鏈選擇菜單（不要點擊，參考 tradegenius-autopilot.user.js）
+        log('懸浮到代幣行以觸發鏈選擇菜單（不點擊）...', 'info');
         targetRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
         await sleep(200);
         
@@ -3028,12 +3325,8 @@
         });
         targetRow.dispatchEvent(rowMouseOver);
         
-        await sleep(500); // 等待 hover 效果觸發菜單
-
-        // 4. 點擊代幣行，打開鏈選擇菜單
-        log('點擊代幣行打開鏈選擇菜單...', 'info');
-        targetRow.click();
-        await sleep(1500);
+        // 等待 hover 效果觸發鏈選擇菜單（.genius-shadow）
+        await sleep(800); // 增加等待時間，確保菜單出現
 
         // 檢查是否已停止
         if (!isRunning) {
@@ -3041,87 +3334,125 @@
             return false;
         }
 
-        // 5. 查找目標鏈選項（參考 tradegenius_userscript.js 的方法）
-        log(`在浮動菜單中查找 ${CONFIG.chainDisplayName} (Optimism) 鏈按鈕...`, 'info');
+        // 4. 查找鏈選擇菜單（.genius-shadow）並在其中查找目標鏈選項
+        log(`在 hover 菜單中查找 ${CONFIG.chainDisplayName} 鏈選項...`, 'info');
         let chainButton = null;
-        let chainContainer = null; // 包含鏈選項的可 hover 容器
+        let chainMenu = null;
 
-        for (let i = 0; i < 10; i++) {
-            // 檢查是否已停止
-            if (!isRunning) {
-                log('⚠️ 選擇接收代幣已取消（程序已停止）', 'warning');
-                return false;
-            }
-
-            const allElements = document.querySelectorAll('*');
-
-            for (const el of allElements) {
-                const text = el.innerText?.trim();
-                const chainNames = [CONFIG.targetChain];
+        // 方法1: 先查找 .genius-shadow 菜單（這是 hover 後出現的菜單）
+        chainMenu = targetRow.querySelector('.genius-shadow');
+        
+        if (chainMenu) {
+            log('✓ 找到鏈選擇菜單 (.genius-shadow)', 'success');
+            
+            // 在菜單中查找鏈選項
+            const chainOptions = chainMenu.querySelectorAll('.cursor-pointer');
+            log(`在菜單中找到 ${chainOptions.length} 個鏈選項`, 'info');
+            
+            for (const opt of chainOptions) {
+                if (!isRunning) {
+                    log('⚠️ 選擇接收代幣已取消（程序已停止）', 'warning');
+                    return false;
+                }
                 
-                // 添加鏈的別名（Optimism/OP 鏈）
+                // 查找包含鏈名稱的元素
+                const chainNameEl = opt.querySelector('span');
+                const chainName = chainNameEl?.innerText?.trim() || '';
+                
+                const chainNames = [CONFIG.targetChain];
                 if (CONFIG.targetChain === 'Optimism') {
                     chainNames.push('OP', 'OP Mainnet', 'Optimism', 'Optimistic Ethereum', 'Optimism Mainnet');
                 }
+                
+                // 檢查是否匹配目標鏈
+                if (chainNames.some(name => chainName === name || chainName.includes(name))) {
+                    chainButton = opt;
+                    log(`✓ 在菜單中找到 ${CONFIG.chainDisplayName} 鏈選項`, 'success');
+                    break;
+                }
+            }
+        }
 
-                // 精確匹配 Optimism 文字（參考 tradegenius_userscript.js）
-                if (text === 'Optimism' || (chainNames.some(name => text === name))) {
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
+        // 方法2: 如果方法1失敗，使用原來的全頁面搜索方法（作為 fallback）
+        if (!chainButton) {
+            log('方法1未找到鏈選項，嘗試方法2（全頁面搜索）...', 'info');
+            
+            for (let i = 0; i < 10; i++) {
+                // 檢查是否已停止
+                if (!isRunning) {
+                    log('⚠️ 選擇接收代幣已取消（程序已停止）', 'warning');
+                    return false;
+                }
 
-                    if (rect.width > 0 && rect.height > 0 &&
-                        style.display !== 'none' &&
-                        style.visibility !== 'hidden' &&
-                        el.offsetParent !== null) {
+                const allElements = document.querySelectorAll('*');
 
-                        const targetRowRect = targetRow.getBoundingClientRect();
-                        // 確保鏈選項在代幣行下方（浮動菜單中）
-                        if (rect.top > targetRowRect.bottom) {
-                            // 找到包含該鏈選項的可 hover 容器（有 hover:bg-genius-blue 的 div）
-                            let hoverContainer = null;
-                            let parent = el.parentElement;
-                            let attempts = 0;
+                for (const el of allElements) {
+                    const text = el.innerText?.trim();
+                    const chainNames = [CONFIG.targetChain];
+                    
+                    // 添加鏈的別名（Optimism/OP 鏈）
+                    if (CONFIG.targetChain === 'Optimism') {
+                        chainNames.push('OP', 'OP Mainnet', 'Optimism', 'Optimistic Ethereum', 'Optimism Mainnet');
+                    }
 
-                            // 向上查找包含 hover:bg-genius-blue 和 cursor-pointer 的容器
-                            while (parent && attempts < 10) {
-                                const classes = parent.className || '';
-                                // 查找包含 hover:bg-genius-blue 的容器
-                                if (classes.includes('hover:bg-genius-blue') && classes.includes('cursor-pointer')) {
-                                    hoverContainer = parent;
-                                    break;
+                    // 精確匹配 Optimism 文字
+                    if (text === 'Optimism' || (chainNames.some(name => text === name))) {
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+
+                        if (rect.width > 0 && rect.height > 0 &&
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden' &&
+                            el.offsetParent !== null) {
+
+                            const targetRowRect = targetRow.getBoundingClientRect();
+                            // 確保鏈選項在代幣行下方（浮動菜單中）
+                            if (rect.top > targetRowRect.bottom) {
+                                // 找到包含該鏈選項的可 hover 容器（有 hover:bg-genius-blue 的 div）
+                                let hoverContainer = null;
+                                let parent = el.parentElement;
+                                let attempts = 0;
+
+                                // 向上查找包含 hover:bg-genius-blue 和 cursor-pointer 的容器
+                                while (parent && attempts < 10) {
+                                    const classes = parent.className || '';
+                                    // 查找包含 hover:bg-genius-blue 的容器
+                                    if (classes.includes('hover:bg-genius-blue') && classes.includes('cursor-pointer')) {
+                                        hoverContainer = parent;
+                                        break;
+                                    }
+                                    parent = parent.parentElement;
+                                    attempts++;
                                 }
-                                parent = parent.parentElement;
-                                attempts++;
-                            }
 
-                            // 找到可點擊的父元素
-                            let clickTarget = el;
-                            parent = el.parentElement;
-                            attempts = 0;
+                                // 找到可點擊的父元素
+                                let clickTarget = el;
+                                parent = el.parentElement;
+                                attempts = 0;
 
-                            while (parent && attempts < 5) {
-                                const classes = parent.className || '';
-                                if (classes.includes('cursor-pointer') ||
-                                    parent.tagName === 'BUTTON' ||
-                                    parent.onclick) {
-                                    clickTarget = parent;
-                                    break;
+                                while (parent && attempts < 5) {
+                                    const classes = parent.className || '';
+                                    if (classes.includes('cursor-pointer') ||
+                                        parent.tagName === 'BUTTON' ||
+                                        parent.onclick) {
+                                        clickTarget = parent;
+                                        break;
+                                    }
+                                    parent = parent.parentElement;
+                                    attempts++;
                                 }
-                                parent = parent.parentElement;
-                                attempts++;
-                            }
 
-                            chainButton = clickTarget;
-                            chainContainer = hoverContainer || clickTarget; // 如果找不到 hover 容器，使用點擊目標
-                            log(`✓ 找到 ${CONFIG.chainDisplayName} (Optimism) 鏈按鈕（嘗試 ${i + 1}/10）`, 'success');
-                            break;
+                                chainButton = clickTarget;
+                                log(`✓ 找到 ${CONFIG.chainDisplayName} 鏈按鈕（方法2，嘗試 ${i + 1}/10）`, 'success');
+                                break;
+                            }
                         }
                     }
                 }
-            }
 
-            if (chainButton) break;
-            await sleep(300);
+                if (chainButton) break;
+                await sleep(300);
+            }
         }
 
         // 檢查是否已停止
@@ -3131,48 +3462,219 @@
         }
 
         if (!chainButton) {
-            log(`⚠️ 未在浮動菜單中找到 ${CONFIG.chainDisplayName} (Optimism) 鏈按鈕，嘗試直接選擇代幣`, 'warning');
+            log(`⚠️ 未在浮動菜單中找到 ${CONFIG.chainDisplayName} 鏈按鈕，嘗試直接選擇代幣（使用默認鏈）`, 'warning');
             // Fallback: 直接點擊代幣（使用默認鏈）
+            // 注意：這裡需要點擊代幣行來選擇代幣
+            targetRow.click();
+            await sleep(1500);
+            await ensureAllDialogsClosed(5);
+            await sleep(500);
             return true;
         }
 
-        // 6. 先 hover 到包含鏈選項的容器（觸發 hover 效果）
-        if (chainContainer && chainContainer !== chainButton) {
-            log('懸浮到鏈選項容器以觸發 hover 效果...', 'info');
-            chainContainer.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            await sleep(200);
-            
-            // 觸發 mouseenter 和 mouseover 事件
-            const mouseEnterEvent = new MouseEvent('mouseenter', {
-                view: window,
-                bubbles: true,
-                cancelable: true
-            });
-            chainContainer.dispatchEvent(mouseEnterEvent);
-            
-            const mouseOverEvent = new MouseEvent('mouseover', {
-                view: window,
-                bubbles: true,
-                cancelable: true
-            });
-            chainContainer.dispatchEvent(mouseOverEvent);
-            
-            log('✓ 已觸發 hover 事件到鏈選項容器', 'success');
-            await sleep(400); // 等待 hover 效果生效
-        }
-
-        // 7. 點擊鏈按鈕
+        // 5. 點擊鏈按鈕（使用更可靠的方式）
+        log(`準備點擊 ${CONFIG.chainDisplayName} 鏈按鈕...`, 'info');
         chainButton.scrollIntoView({ behavior: 'smooth', block: 'center' });
         await sleep(200);
-        chainButton.click();
-        log(`✓ 選擇了 ${targetToken} (${CONFIG.chainDisplayName} 鏈)`, 'success');
-        await sleep(1500);
+        
+        // 先 hover 到鏈按鈕本身，確保它處於可點擊狀態
+        const chainMouseEnter = new MouseEvent('mouseenter', {
+            view: window,
+            bubbles: true,
+            cancelable: true
+        });
+        chainButton.dispatchEvent(chainMouseEnter);
+        
+        const chainMouseOver = new MouseEvent('mouseover', {
+            view: window,
+            bubbles: true,
+            cancelable: true
+        });
+        chainButton.dispatchEvent(chainMouseOver);
+        await sleep(150);
+        
+        // 使用多種方式觸發點擊，確保點擊生效
+        try {
+            // 方法1: 直接 click（最可靠的方式）
+            chainButton.click();
+            log(`✓ 已點擊 ${CONFIG.chainDisplayName} 鏈按鈕`, 'success');
+            
+            // 方法2: 如果方法1失敗，觸發 mousedown 和 mouseup 事件（模擬真實點擊）
+            await sleep(100);
+            const mouseDown = new MouseEvent('mousedown', {
+                view: window,
+                bubbles: true,
+                cancelable: true,
+                button: 0
+            });
+            chainButton.dispatchEvent(mouseDown);
+            
+            await sleep(50);
+            
+            const mouseUp = new MouseEvent('mouseup', {
+                view: window,
+                bubbles: true,
+                cancelable: true,
+                button: 0
+            });
+            chainButton.dispatchEvent(mouseUp);
+        } catch (error) {
+            log(`⚠️ 點擊鏈按鈕時出錯: ${error.message}`, 'warning');
+        }
+        
+        await sleep(2000); // 增加等待時間，確保選擇生效
 
-        // 6. 確保視窗已關閉
+        // 8. 驗證選擇是否成功
+        log('驗證第二個代幣是否選擇成功...', 'info');
+        let selectionVerified = false;
+        
+        for (let verifyAttempt = 0; verifyAttempt < 5; verifyAttempt++) {
+            if (!isRunning) {
+                log('⚠️ 驗證過程已取消（程序已停止）', 'warning');
+                return false;
+            }
+
+            // 確保視窗已關閉
+            await ensureAllDialogsClosed(3);
+            await sleep(300);
+
+            // 檢查第二個代幣按鈕是否顯示了目標代幣名稱
+            const allTokenBtns = findAllTokenSelectionButtons();
+            if (allTokenBtns.length >= 2) {
+                const secondBtn = allTokenBtns[1]; // 第二個按鈕（接收代幣）
+                const btnText = (secondBtn.innerText || '').trim();
+                const btnSpanText = (secondBtn.querySelector('span')?.innerText || '').trim();
+                
+                // 檢查按鈕是否顯示了目標代幣名稱（而不是 "Choose"）
+                const hasTargetToken = btnText.includes(targetToken) || btnSpanText.includes(targetToken);
+                const isNotChoose = !btnText.includes('Choose') && !btnText.includes('选择') && 
+                                   !btnSpanText.includes('Choose') && !btnSpanText.includes('选择');
+                
+                if (hasTargetToken && isNotChoose) {
+                    log(`✓ 驗證成功：第二個代幣按鈕顯示 ${targetToken}`, 'success');
+                    selectionVerified = true;
+                    break;
+                } else {
+                    log(`驗證嘗試 ${verifyAttempt + 1}/5：按鈕文字為 "${btnText}"，等待 UI 更新...`, 'info');
+                    await sleep(500);
+                }
+            } else {
+                log(`驗證嘗試 ${verifyAttempt + 1}/5：未找到足夠的代幣按鈕，等待 UI 更新...`, 'info');
+                await sleep(500);
+            }
+        }
+
+        if (!selectionVerified) {
+            log(`⚠️ 無法驗證第二個代幣選擇是否成功，嘗試重試選擇鏈...`, 'warning');
+            
+            // 重試一次：重新打開代幣選擇視窗並選擇鏈
+            // 檢查是否還需要選擇（視窗可能已關閉）
+            if (!isDialogOpen()) {
+                // 如果視窗已關閉，重新點擊第二個代幣按鈕打開視窗
+                const allTokenBtns = findAllTokenSelectionButtons();
+                if (allTokenBtns.length >= 2) {
+                    const secondBtn = allTokenBtns[1];
+                    log('重新點擊第二個代幣按鈕以打開選擇視窗...', 'info');
+                    secondBtn.click();
+                    await sleep(CONFIG.waitAfterChoose);
+                }
+            }
+            
+            // 如果視窗已打開，嘗試重新選擇鏈
+            if (isDialogOpen()) {
+                log('重試選擇鏈...', 'info');
+                
+                // 重新查找代幣行和鏈按鈕（因為 DOM 可能已更新）
+                const retryRows = document.querySelectorAll('[role="dialog"] .cursor-pointer, [role="dialog"] .relative.group');
+                let retryTargetRow = null;
+                
+                for (const row of retryRows) {
+                    const text = row.textContent || '';
+                    const hasTarget = targetToken === 'USDT' ? text.includes('USDT') && !text.includes('USDC') : 
+                                    text.includes('USDC') && !text.includes('USDT');
+                    const hasPrice = text.includes('$');
+                    
+                    if (hasTarget && hasPrice) {
+                        retryTargetRow = row;
+                        break;
+                    }
+                }
+                
+                if (retryTargetRow) {
+                    // 重新 hover 到代幣行
+                    retryTargetRow.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+                    retryTargetRow.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                    await sleep(800);
+                    
+                    // 重新查找鏈選擇菜單
+                    const retryChainMenu = retryTargetRow.querySelector('.genius-shadow');
+                    if (retryChainMenu) {
+                        const retryChainOptions = retryChainMenu.querySelectorAll('.cursor-pointer');
+                        let retryChainButton = null;
+                        
+                        for (const opt of retryChainOptions) {
+                            const chainNameEl = opt.querySelector('span');
+                            const chainName = chainNameEl?.innerText?.trim() || '';
+                            const chainNames = [CONFIG.targetChain];
+                            if (CONFIG.targetChain === 'Optimism') {
+                                chainNames.push('OP', 'OP Mainnet', 'Optimism', 'Optimistic Ethereum', 'Optimism Mainnet');
+                            }
+                            
+                            if (chainNames.some(name => chainName === name || chainName.includes(name))) {
+                                retryChainButton = opt;
+                                break;
+                            }
+                        }
+                        
+                        if (retryChainButton) {
+                            retryChainButton.click();
+                            await sleep(2000);
+                            
+                            // 再次驗證
+                            await ensureAllDialogsClosed(3);
+                            await sleep(500);
+                            
+                            const retryAllTokenBtns = findAllTokenSelectionButtons();
+                            if (retryAllTokenBtns.length >= 2) {
+                                const retrySecondBtn = retryAllTokenBtns[1];
+                                const retryBtnText = (retrySecondBtn.innerText || '').trim();
+                                const retryBtnSpanText = (retrySecondBtn.querySelector('span')?.innerText || '').trim();
+                                const retryHasTargetToken = retryBtnText.includes(targetToken) || retryBtnSpanText.includes(targetToken);
+                                const retryIsNotChoose = !retryBtnText.includes('Choose') && !retryBtnText.includes('选择');
+                                
+                                if (retryHasTargetToken && retryIsNotChoose) {
+                                    log(`✓ 重試後驗證成功：第二個代幣按鈕顯示 ${targetToken}`, 'success');
+                                    selectionVerified = true;
+                                } else {
+                                    log(`⚠️ 重試後仍無法驗證選擇是否成功，按鈕文字為 "${retryBtnText}"`, 'warning');
+                                }
+                            }
+                        } else {
+                            log('⚠️ 重試時未找到鏈按鈕', 'warning');
+                        }
+                    } else {
+                        log('⚠️ 重試時未找到鏈選擇菜單', 'warning');
+                    }
+                } else {
+                    log('⚠️ 重試時未找到代幣行', 'warning');
+                }
+            }
+            
+            if (!selectionVerified) {
+                log(`⚠️ 無法驗證第二個代幣選擇是否成功，但繼續執行（可能是驗證邏輯的問題）`, 'warning');
+            }
+        }
+
+        // 9. 確保視窗已關閉
         log('確保代幣選擇視窗已關閉...', 'info');
         await ensureAllDialogsClosed(5);
         await sleep(500);
 
+        if (selectionVerified) {
+            log(`✓ 選擇了 ${targetToken} (${CONFIG.chainDisplayName} 鏈)`, 'success');
+        } else {
+            log(`⚠️ 選擇了 ${targetToken} (${CONFIG.chainDisplayName} 鏈)（未驗證）`, 'warning');
+        }
         return true;
     }
 

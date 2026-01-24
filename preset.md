@@ -8,7 +8,7 @@
 - **Slippage**: 0.05% (所有 M.Cap 選項)
 - **Priority**: 0.002 gwei
 - **鏈**: Optimism (OP)
-- **總步驟數**: 15 步
+- **總步驟數**: 16 步
 
 ---
 
@@ -284,11 +284,91 @@
 - 查找文字為 "Aggregator/Fast Swaps" 的元素
 - 確認包含 `cursor-pointer` 和 `hover:bg-genius-pink/20` 類
 
-**驗證**: 點擊後應出現 "Globally disable fast swaps" 標籤
+**驗證**: 點擊後應出現 "Globally disable fast swaps" 標籤和 EVM 聚合器選項
 
 ---
 
-### 步驟 12: 打開 Globally disable fast swaps 中的 EVM
+### 步驟 12: 設定聚合器來源（只開啟 odos、0x、KyberSwap、OpenOcean、UniswapV3、Ve33）
+
+**說明**: 在 EVM 區塊下，只開啟 odos、0x、KyberSwap、OpenOcean、UniswapV3、Ve33 六個聚合器，關閉其他聚合器
+
+**目標聚合器**（需要開啟）:
+- `odos`
+- `0x`
+- `KyberSwap`
+- `OpenOcean`
+- `UniswapV3`
+- `Ve33`
+
+**需要關閉的聚合器**:
+- `OKX`
+- `LiFi`
+- `EvmDirectPool`
+- `LFJ`
+- `Algebra`
+- `UniswapV2`
+- 以及其他所有未列出的聚合器
+
+**HTML 結構**:
+```html
+<div class="pl-2.5">
+  <div class="text-sm text-genius-cream/50">EVM</div>
+  <div class="border border-genius-blue rounded-sm p-2.5 flex items-start justify-between gap-2">
+    <div class="flex flex-col items-start justify-between gap-2 w-[40%]">
+      <div class="flex items-center gap-2 justify-between w-full">
+        <div class="text-xs text-genius-cream/50 capitalize">odos</div>
+        <button type="button" role="switch" aria-checked="true" data-state="checked" ...>
+          <span data-state="checked" ...></span>
+        </button>
+      </div>
+      <div class="flex items-center gap-2 justify-between w-full">
+        <div class="text-xs text-genius-cream/50 capitalize">KyberSwap</div>
+        <button type="button" role="switch" aria-checked="true" data-state="checked" ...>
+          <span data-state="checked" ...></span>
+        </button>
+      </div>
+      <div class="flex items-center gap-2 justify-between w-full">
+        <div class="text-xs text-genius-cream/50 capitalize">0x</div>
+        <button type="button" role="switch" aria-checked="true" data-state="checked" ...>
+          <span data-state="checked" ...></span>
+        </button>
+      </div>
+      <!-- 其他聚合器... -->
+    </div>
+  </div>
+</div>
+```
+
+**識別方式**: 
+1. 查找包含 "EVM" 文字的標籤（在 "Aggregator/Fast Swaps" 展開後的區域）
+2. 在 EVM 區塊容器中查找所有聚合器選項
+3. 每個聚合器選項包含：
+   - 一個文字標籤（例如 "odos"、"0x"、"KyberSwap"）
+   - 一個 `role="switch"` 的按鈕
+
+**詳細步驟**:
+
+1. **開啟目標聚合器**（如果未開啟）:
+   - 查找文字為 "odos" 的標籤
+   - 在同一個容器中查找 `role="switch"` 的按鈕
+   - 檢查 `data-state` 或 `aria-checked` 屬性
+   - 如果為 `unchecked` 或 `false`，則點擊開關使其變為 `checked`
+   - 重複此步驟處理 "0x"、"KyberSwap"、"OpenOcean"、"UniswapV3"、"Ve33"
+
+2. **關閉其他聚合器**（如果已開啟）:
+   - 在 EVM 區塊中查找所有聚合器選項
+   - 對於每個聚合器，檢查其名稱是否為 "odos"、"0x"、"KyberSwap"、"OpenOcean"、"UniswapV3"、"Ve33"
+   - 如果不是這六個，且開關為 `checked`，則點擊開關使其變為 `unchecked`
+
+**注意事項**: 
+- ⚠️ **必須在 EVM 區塊下操作**，不是 Solana 區塊
+- ⚠️ 只處理 EVM 區塊的聚合器，Solana 區塊的聚合器不需要修改
+- ⚠️ 每個聚合器開關切換後需要等待約 0.5 秒讓 UI 更新
+- ⚠️ 確保只開啟 odos、0x、KyberSwap、OpenOcean、UniswapV3、Ve33 六個聚合器
+
+---
+
+### 步驟 13: 打開 Globally disable fast swaps 中的 EVM
 
 **說明**: 啟用 EVM 鏈的 "Globally disable fast swaps" 選項
 
@@ -326,7 +406,7 @@
 
 ---
 
-### 步驟 13: 打開 EVM Simulations
+### 步驟 14: 打開 EVM Simulations
 
 **說明**: 啟用 EVM Simulations 選項
 
@@ -352,7 +432,7 @@
 
 ---
 
-### 步驟 14: 點擊 Fees 設定
+### 步驟 15: 點擊 Fees 設定
 
 **說明**: 展開 Fees 設定選項
 
@@ -371,7 +451,7 @@
 
 ---
 
-### 步驟 15: 打開 Show Fees
+### 步驟 16: 打開 Show Fees
 
 **說明**: 啟用 Show Fees 選項
 
@@ -469,11 +549,11 @@
 
 ## 總結
 
-此 Preset 設定流程包含 15 個步驟，主要設定：
+此 Preset 設定流程包含 16 個步驟，主要設定：
 - ✅ Optimism 鏈
 - ✅ Buy/Sell 方的 Slippage（所有 M.Cap 選項）
 - ✅ Buy/Sell 方的 Priority
-- ✅ Aggregator/Fast Swaps 設定
+- ✅ Aggregator/Fast Swaps 設定（聚合器來源：只開啟 odos、0x、KyberSwap、OpenOcean、UniswapV3、Ve33）
 - ✅ EVM Simulations
 - ✅ Show Fees
 
