@@ -574,6 +574,15 @@
             });
     };
 
+    // 用於 SWAP 數量：點 50% 以預留 GAS（不再使用 MAX 全部換）
+    const find50PercentButton = () => {
+        return Array.from(document.querySelectorAll('button'))
+            .find(b => {
+                const text = b.innerText.trim();
+                return text === '50%';
+            });
+    };
+
     const findConfirmButton = () => {
         // 根據用戶反饋，Confirm 按鈕實際上是可以按的，即使顯示為 disabled
         // 所以我們先查找按鈕，然後檢查是否真的不可點擊
@@ -4880,14 +4889,14 @@
                     log('✓ 代幣選擇完成', 'success');
                     await sleep(1000);
                     // 注意：lastCycleFromToken 已在選擇第一個代幣完成時記錄
-                    // 代幣選擇完成後，繼續執行後續的 MAX 和 Confirm 步驟，不要直接 continue
+                    // 代幣選擇完成後，繼續執行後續的 50% 和 Confirm 步驟，不要直接 continue
                 }
 
-                // 3. 檢查 MAX 按鈕狀態
-                const maxBtn = findMaxButton();
+                // 3. 檢查 50% 按鈕狀態（改為 50% 以預留 GAS，不再用 MAX）
+                const amountBtn = find50PercentButton();
 
-                if (maxBtn && maxBtn.disabled) {
-                    log('MAX 按鈕被禁用，嘗試切換方向...', 'warning');
+                if (amountBtn && amountBtn.disabled) {
+                    log('50% 按鈕被禁用，嘗試切換方向...', 'warning');
                     const switchBtn = findSwitchButton();
                     if (switchBtn) {
                         switchBtn.click();
@@ -4901,16 +4910,16 @@
                     }
                 }
 
-                if (maxBtn && !maxBtn.disabled) {
-                    maxBtn.click();
-                    log('✓ 點擊 MAX', 'success');
+                if (amountBtn && !amountBtn.disabled) {
+                    amountBtn.click();
+                    log('✓ 點擊 50%', 'success');
                     await sleep(CONFIG.waitAfterMax);
                     
-                    // 額外等待，確保 MAX 點擊後 UI 更新完成
-                    log('⏳ 等待 MAX 點擊後的 UI 更新...', 'info');
+                    // 額外等待，確保 50% 點擊後 UI 更新完成
+                    log('⏳ 等待 50% 點擊後的 UI 更新...', 'info');
                     await sleep(1000);
-                } else if (!maxBtn) {
-                    log('未找到 MAX 按鈕', 'warning');
+                } else if (!amountBtn) {
+                    log('未找到 50% 按鈕', 'warning');
                     consecutiveFailures++;
                     await sleep(2000);
                     continue;
