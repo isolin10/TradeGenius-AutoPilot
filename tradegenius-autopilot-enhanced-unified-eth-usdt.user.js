@@ -4889,14 +4889,16 @@
                     log('✓ 代幣選擇完成', 'success');
                     await sleep(1000);
                     // 注意：lastCycleFromToken 已在選擇第一個代幣完成時記錄
-                    // 代幣選擇完成後，繼續執行後續的 50% 和 Confirm 步驟，不要直接 continue
+                    // 代幣選擇完成後，繼續執行後續的數量按鈕和 Confirm 步驟，不要直接 continue
                 }
 
-                // 3. 檢查 50% 按鈕狀態（改為 50% 以預留 GAS，不再用 MAX）
-                const amountBtn = find50PercentButton();
+                // 3. 依發送幣種選擇數量按鈕：USDT→ETH 用 MAX，ETH→USDT 用 50%（預留 GAS）
+                const useMax = currentFromToken === 'USDT';
+                const amountBtn = useMax ? findMaxButton() : find50PercentButton();
+                const amountLabel = useMax ? 'MAX' : '50%';
 
                 if (amountBtn && amountBtn.disabled) {
-                    log('50% 按鈕被禁用，嘗試切換方向...', 'warning');
+                    log(`${amountLabel} 按鈕被禁用，嘗試切換方向...`, 'warning');
                     const switchBtn = findSwitchButton();
                     if (switchBtn) {
                         switchBtn.click();
@@ -4912,14 +4914,13 @@
 
                 if (amountBtn && !amountBtn.disabled) {
                     amountBtn.click();
-                    log('✓ 點擊 50%', 'success');
+                    log(`✓ 點擊 ${amountLabel} (${currentFromToken} → ${currentFromToken === 'USDT' ? 'ETH' : 'USDT'})`, 'success');
                     await sleep(CONFIG.waitAfterMax);
                     
-                    // 額外等待，確保 50% 點擊後 UI 更新完成
-                    log('⏳ 等待 50% 點擊後的 UI 更新...', 'info');
+                    log(`⏳ 等待 ${amountLabel} 點擊後的 UI 更新...`, 'info');
                     await sleep(1000);
                 } else if (!amountBtn) {
-                    log('未找到 50% 按鈕', 'warning');
+                    log(`未找到 ${amountLabel} 按鈕`, 'warning');
                     consecutiveFailures++;
                     await sleep(2000);
                     continue;
