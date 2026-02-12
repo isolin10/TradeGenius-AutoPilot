@@ -3586,12 +3586,17 @@
         }
 
         // 核心判斷邏輯：
-        // 正常情況下，SWAP 成功後幣種會切換（ETH ⇄ USDT）
-        // 如果這次要 SWAP 的幣種和上次一樣，代表上次 SWAP 失敗了
+        // - USDT→ETH 用 MAX：成功後應變 ETH，若這次仍是 USDT = 上次失敗。
+        // - ETH→USDT 用 50%：成功後仍會剩餘 ETH，下次仍選 ETH 是正常，不可判為失敗。
         const tokensAreSame = currentFromToken === lastCycleFromToken;
 
         if (tokensAreSame) {
-            // 幣種相同 → 上一次 SWAP 失敗
+            if (lastCycleFromToken === 'ETH') {
+                // ETH→USDT 只換 50%，成功後還有 ETH，本次仍選 ETH 屬正常
+                log(`✓ 幣種比較判斷：上次 SWAP ETH→USDT(50%) 成功，本次仍選 ETH（剩餘）→ 視為上次成功`, 'success');
+                return { shouldUpdate: true, wasSuccess: true };
+            }
+            // USDT→ETH 用 MAX，若這次仍是 USDT 代表上次失敗
             log(`❌ 幣種比較判斷：上次要 SWAP ${lastCycleFromToken}，這次仍要 SWAP ${currentFromToken} → 上次交易失敗`, 'error');
             return { shouldUpdate: true, wasSuccess: false };
         } else {
